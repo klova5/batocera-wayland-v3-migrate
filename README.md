@@ -19,6 +19,22 @@ python3 /userdata/system/batocera_v3_migrate.py
 
 With no arguments, it runs whichever step comes next.
 
+## Ports menu (controller)
+
+```
+python3 /userdata/system/batocera_v3_migrate.py launcher install
+```
+
+This adds **V3 Migration** to ES's **Ports** list, so every step can be run from the couch. It works with stock ES and with custom frontends such as GCM, because it is an ordinary Ports entry. It opens a full-screen menu showing the board, the current step and the next one, with the next step already selected:
+
+- **Before the update:** Scan, Back up (pick a drive under `/media`, or internal), Prepare for the update, then Update now or Undo prepare.
+- **After the update, on v3:** Integrate (safe to repeat).
+- **Any time:** Status and Last result.
+
+Each step asks Yes/No first, shows its output live, then shows the result in a scrollable view. A step keeps running even if the window is closed; opening the menu again follows it to the end. Output is kept in `/userdata/system/logs/v3-migrate-menu.log`. Rollback is not in the menu: it rewrites the boot partition, so it stays an SSH command.
+
+Controller: D-pad or left stick moves, **B** or **Start** selects, **A** or **Select** goes back, **X** switches buttons, **L1/R1** page up and down. Without `dialog` the menu falls back to numbered choices (keyboard). Remove it with `launcher remove`. `integrate` refreshes an installed launcher.
+
 ## The four steps
 
 | Step | When | What it does |

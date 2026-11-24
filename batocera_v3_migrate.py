@@ -21,6 +21,8 @@ Phases (run in order, all on the Batocera box over SSH):
   rollback       put the backed-up x86_64 boot partition back
   status         show where you are
   init-plugin    write an integration template for something custom
+  launcher       install|remove "V3 Migration" in ES's Ports list: a menu for
+                 all of the above that works with a controller (`menu`)
 
 Every command that changes something asks for a typed confirmation unless
 --yes is given, and every file it edits is copied first.
@@ -41,7 +43,7 @@ import sys
 import tarfile
 import urllib.request
 
-VERSION = "2.0.1"
+VERSION = "2.1.0"
 
 # --------------------------------------------------------------------------
 # paths (everything goes through P() so the tool can be tested on a mock tree)
@@ -3048,6 +3050,8 @@ def cmd_integrate_all(args):
     step("overlay", lambda: integrate_overlay(st, tag, done, manual))
     write_json(STATE_DIR + "/state.json", st)
     step("watchdog", lambda: done.extend(fix_launch_watchdog(a, tag)) if not watchdog_state()["enabled"] else None)
+    step("launcher", lambda: done.extend(launcher_install(tag))
+         if launcher_state()["installed"] and not launcher_state()["current"] else None)
     # the original checks: display remap, re-enable clean services, plugins, library re-check
     R = do_integrate(True, ack_overlay=bool(st.get("overlay_integrated")))
     done += R["changes"]
@@ -3112,6 +3116,400 @@ def cmd_auto(args):
     return cmd_update(args)
 
 
+# --------------------------------------------------------------------------
+# Ports launcher: "V3 Migration" in ES's Ports list opens a controller-driven menu
+# --------------------------------------------------------------------------
+LAUNCHER_SH = "/userdata/roms/ports/V3 Migration.sh"
+LAUNCHER_KEYS = LAUNCHER_SH + ".keys"
+LAUNCHER_MARK = "# v3-migrate-launcher"
+MENU_LOG = "/userdata/system/logs/v3-migrate-menu.log"
+MENU_LAST = STATE_DIR + "/menu-last-run.log"
+MENU_RUN = STATE_DIR + "/menu-run.json"
+MENU_TITLE = "x86-64-v3 Migration"
+TOOL_PLACES = ["/userdata/system/add-ons/v3-migrate/batocera_v3_migrate.py",
+               "/userdata/system/batocera_v3_migrate.py"]
+
+LAUNCHER_SRC = """#!/bin/bash
+%(mark)s
+# x86-64-v3 Migration menu, opened from ES's Ports list. Written by
+#   batocera_v3_migrate.py launcher install      (remove with: launcher remove)
+# Controller: D-pad/stick move, B or Start = OK, A or Select = back, L1/R1 = page.
+TOOL=%(tool)s
+for t in "$TOOL" %(places)s; do
+    if [ -f "$t" ]; then TOOL="$t"; break; fi
+done
+export DISPLAY="${DISPLAY:-:0}"
+LOG=/userdata/system/logs/v3-migrate-menu.log
+mkdir -p /userdata/system/logs
+if [ ! -f "$TOOL" ]; then
+    echo "$(date '+%%F %%T') launcher: migration tool not found" >>"$LOG"
+    curl -s -m 5 --data "x86-64-v3 Migration: the tool is missing. Reinstall it from BUA." \\
+        http://127.0.0.1:1234/messagebox >/dev/null 2>&1
+    exit 1
+fi
+if command -v xterm >/dev/null 2>&1; then
+    xterm -fs 20 -maximized -fg white -bg black -fa DejaVuSansMono -en UTF-8 \\
+        -T "x86-64-v3 Migration" -e python3 -B "$TOOL" menu 2>>"$LOG"
+    exit 0
+fi
+echo "$(date '+%%F %%T') launcher: xterm not found" >>"$LOG"
+curl -s -m 5 --data "x86-64-v3 Migration needs xterm, which this system lacks. Over SSH run: python3 $TOOL" \\
+    http://127.0.0.1:1234/messagebox >/dev/null 2>&1
+exit 1
+"""
+
+# Batocera's names: b = confirm (south), a = back (east); same layout as BUA's ports.
+LAUNCHER_KEYS_SRC = {"actions_player1": [
+    {"trigger": "up", "type": "key", "target": "KEY_UP"},
+    {"trigger": "down", "type": "key", "target": "KEY_DOWN"},
+    {"trigger": "left", "type": "key", "target": "KEY_LEFT"},
+    {"trigger": "right", "type": "key", "target": "KEY_RIGHT"},
+    {"trigger": "joystick1up", "type": "key", "target": "KEY_UP"},
+    {"trigger": "joystick1down", "type": "key", "target": "KEY_DOWN"},
+    {"trigger": "joystick1left", "type": "key", "target": "KEY_LEFT"},
+    {"trigger": "joystick1right", "type": "key", "target": "KEY_RIGHT"},
+    {"trigger": "b", "type": "key", "target": "KEY_ENTER"},
+    {"trigger": "start", "type": "key", "target": "KEY_ENTER"},
+    {"trigger": "a", "type": "key", "target": "KEY_ESC"},
+    {"trigger": "select", "type": "key", "target": "KEY_ESC"},
+    {"trigger": "x", "type": "key", "target": "KEY_TAB"},
+    {"trigger": "pageup", "type": "key", "target": "KEY_PAGEUP"},
+    {"trigger": "pagedown", "type": "key", "target": "KEY_PAGEDOWN"},
+]}
+
+
+def tool_path():
+    return UNP(os.path.abspath(__file__))
+
+
+def launcher_text(tool=None):
+    import shlex
+    tool = tool or tool_path()
+    return LAUNCHER_SRC % {"mark": LAUNCHER_MARK, "tool": shlex.quote(tool),
+                           "places": " ".join(shlex.quote(p) for p in TOOL_PLACES if p != tool)}
+
+
+def launcher_state():
+    sh = read(LAUNCHER_SH)
+    return {"installed": LAUNCHER_MARK in sh, "present": os.path.lexists(P(LAUNCHER_SH)),
+            "current": sh == launcher_text()}
+
+
+def es_reload_games():
+    if TEST_MODE():
+        return
+    try:
+        urllib.request.urlopen("http://127.0.0.1:1234/reloadgames", timeout=5).read()
+    except Exception:
+        pass  # ES not running (or no web API): the entry shows after the next ES start
+
+
+def launcher_install(tag=None):
+    st = launcher_state()
+    if st["present"] and not st["installed"]:
+        raise RuntimeError("%s exists and was not written by this tool; not touching it" % LAUNCHER_SH)
+    tag = tag or stamp()
+    out = []
+    keys = json.dumps(LAUNCHER_KEYS_SRC, indent=4) + "\n"
+    for path, text, mode in ((LAUNCHER_SH, launcher_text(), 0o755), (LAUNCHER_KEYS, keys, 0o644)):
+        if read(path) == text:
+            continue
+        if os.path.exists(P(path)):
+            fix_backup(path, tag)
+        os.makedirs(os.path.dirname(P(path)), exist_ok=True)
+        tmp = P(path) + ".v3m.tmp"
+        with open(tmp, "w") as fh:
+            fh.write(text)
+        os.chmod(tmp, mode)
+        os.replace(tmp, P(path))
+        out.append("wrote %s" % path)
+    if not bash_ok(P(LAUNCHER_SH)):
+        raise RuntimeError("the launcher failed bash -n; see %s" % LAUNCHER_SH)
+    if out:
+        es_reload_games()
+        out.append("'V3 Migration' is in Ports (runs %s)" % tool_path())
+    return out
+
+
+def launcher_remove():
+    if not launcher_state()["installed"]:
+        return []
+    out = []
+    for path in (LAUNCHER_SH, LAUNCHER_KEYS):
+        if os.path.lexists(P(path)):
+            os.remove(P(path))
+            out.append("removed %s" % path)
+    es_reload_games()
+    return out
+
+
+def cmd_launcher(args):
+    try:
+        if args.action == "install":
+            out = launcher_install() or ["already up to date: %s" % LAUNCHER_SH]
+        elif args.action == "remove":
+            out = launcher_remove() or ["not installed"]
+        else:
+            s = launcher_state()
+            out = ["%s: %s" % (LAUNCHER_SH, "installed" + ("" if s["current"] else " (older version; "
+                                                                "run: launcher install)") if s["installed"]
+                               else "present, not ours" if s["present"] else "not installed")]
+    except (OSError, RuntimeError) as e:
+        say("Launcher: %s" % e)
+        return 1
+    for line in out:
+        say("  " + line)
+    return 0
+
+
+# ---- the menu itself (runs in xterm; dialog if present, plain text otherwise)
+class DialogUI:
+    def __init__(self, exe):
+        self.exe = exe
+
+    def _run(self, args):
+        env = dict(os.environ, DIALOGRC=os.environ.get("DIALOGRC", "/userdata/system/add-ons/.dialogrc"))
+        r = subprocess.run([self.exe, "--backtitle", "%s  (tool v%s)" % (MENU_TITLE, VERSION)] + args,
+                           stderr=subprocess.PIPE, env=env)
+        return r.returncode, r.stderr.decode(errors="replace").strip()
+
+    def menu(self, text, items, default=None, cancel="Back"):
+        args = ["--title", MENU_TITLE, "--no-tags", "--ok-label", "Select", "--cancel-label", cancel]
+        if default:
+            args += ["--default-item", default]
+        flat = [x for k, label in items for x in (k, label)]
+        rc, out = self._run(args + ["--menu", text, "0", "0", str(min(len(items), 12))] + flat)
+        return out if rc == 0 else None
+
+    def yesno(self, text):
+        return self._run(["--title", MENU_TITLE, "--yesno", text, "0", "0"])[0] == 0
+
+    def msgbox(self, text):
+        self._run(["--title", MENU_TITLE, "--msgbox", text, "0", "0"])
+
+    def textbox(self, path, title):
+        self._run(["--title", title, "--exit-label", "Back", "--textbox", path, "-1", "-1"])
+
+    def clear(self):
+        sys.stdout.write("\033[2J\033[H")
+        sys.stdout.flush()
+
+
+class PlainUI:
+    """No dialog: numbered menus for a keyboard (or SSH)."""
+
+    def _ask(self, prompt):
+        try:
+            return input(prompt).strip()
+        except EOFError:
+            return ""
+
+    def menu(self, text, items, default=None, cancel="Back"):
+        say("\n" + text)
+        for n, (k, label) in enumerate(items, 1):
+            say("  %d) %s%s" % (n, label, "   <- next" if k == default else ""))
+        ans = self._ask("Number (Enter = %s): " % cancel.lower())
+        return items[int(ans) - 1][0] if ans.isdigit() and 0 < int(ans) <= len(items) else None
+
+    def yesno(self, text):
+        return self._ask("\n%s\n[y/N] " % text).lower() in ("y", "yes")
+
+    def msgbox(self, text):
+        self._ask("\n%s\n(Enter) " % text)
+
+    def textbox(self, path, title):
+        say("\n== %s ==" % title)
+        say(read(path))
+        self._ask("(Enter) ")
+
+    def clear(self):
+        pass
+
+
+def menu_ui():
+    exe = os.environ.get("V3M_DIALOG") or shutil.which("dialog")
+    return DialogUI(exe) if exe else PlainUI()
+
+
+def pid_alive(pid, marker=None):
+    try:
+        os.kill(int(pid), 0)
+        if marker:
+            with open("/proc/%d/cmdline" % int(pid), "rb") as fh:
+                return marker.encode() in fh.read()
+        return True
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+def backup_targets():
+    """(path, label) for every mounted drive under /media, plus the internal default."""
+    out, mounts = [], {}
+    for line in read("/proc/mounts").splitlines():
+        f = line.split()
+        if len(f) >= 3:
+            mounts[f[1].replace("\\040", " ")] = f[2]
+    media = P("/media")
+    for n in sorted(os.listdir(media)) if os.path.isdir(media) else []:
+        path = "/media/" + n
+        if path not in mounts and not TEST_MODE():
+            continue
+        try:
+            du = shutil.disk_usage(P(path))
+        except OSError:
+            continue
+        out.append((path, "%s free of %s  (%s)" % (human(du.free), human(du.total), mounts.get(path, "?"))))
+    internal = STATE_DIR + "/backups"
+    try:
+        free = human(shutil.disk_usage(P("/userdata")).free)
+    except OSError:
+        free = "?"
+    out.append((internal, "internal /userdata (%s free) - no protection if this disk fails" % free))
+    return out
+
+
+def menu_steps(st, board):
+    """[(key, label, argv, confirm text)] for this board and phase; plus the suggested next key."""
+    phase = st.get("phase") or "start"
+    if board == V3_BOARD:
+        again = phase.startswith("integrated")
+        steps = [("integrate", "Integrate%s" % (" again (safe to repeat)" if again else
+                                                 "  - finish the move to x86-64-v3"), ["integrate"],
+                  "Integrate everything the update affected into x86-64-v3: hooks, Xwayland access, "
+                  "services, overlay files, display output, launch watchdog and rescue combo.\n\n"
+                  "Every file it changes is backed up first. Run it?")]
+        nxt = "integrate"
+    elif board == V1_BOARD:
+        scanned = bool(load_json(SCAN_FILE)) and phase != "start"
+        backed = bool(st.get("backup_verified"))
+        steps = [("scan", "Scan%s  - find what the update affects (read-only)" % (" again" if scanned else ""),
+                  ["scan"], "Scan the system for everything the x86-64-v3 update affects?\n\n"
+                  "Read-only. It takes a few minutes."),
+                 ("backup", "Back up  - those files + the boot partition (for rollback)", None, None)]
+        if phase == "prepared":
+            steps += [("update-now", "Update now  - download and install x86-64-v3 from here", ["update", "--now"],
+                       "Download and install the x86-64-v3 image now with Batocera's upgrader?\n\n"
+                       "When it finishes, reboot, then open V3 Migration again to integrate."),
+                      ("unprepare", "Undo prepare  - put the overlay and services back", ["unprepare"],
+                       "Undo prepare: put the parked overlay and services back as they were?")]
+        else:
+            steps += [("prepare", "Prepare for the update  - then use Updates & Downloads", ["update"],
+                       "Prepare for the update: move the x86_64 overlay into the backup and park the "
+                       "X11-only services (both take effect at the next boot).\n\n"
+                       "Afterwards start the x86-64-v3 upgrade from Updates & Downloads. Run it?")]
+        nxt = "scan" if not scanned else "backup" if not backed else \
+            "update-now" if phase == "prepared" else "prepare"
+    else:
+        steps, nxt = [], None
+    steps += [("status", "Status  - where the migration is", ["status"], None),
+              ("log", "Last result  - the output of the last step", None, None)]
+    return steps, nxt
+
+
+def menu_run(ui, argv, label):
+    """Run one step of this tool in its own session (so closing the window can't cut it off),
+    showing its output live; then show the result. Returns the exit code."""
+    os.makedirs(os.path.dirname(P(MENU_LAST)), exist_ok=True)
+    os.makedirs(os.path.dirname(P(MENU_LOG)), exist_ok=True)
+    cmd = [sys.executable, "-u", "-B", os.path.abspath(__file__), "--yes"]
+    if TEST_MODE():
+        cmd += ["--root", ROOT]
+    cmd += argv
+    ui.clear()
+    say("== %s ==  (keep this window open; the step finishes even if it closes)\n" % label)
+    with open(P(MENU_LAST), "w") as fh:
+        fh.write("%s  %s: %s\n\n" % (now(), label, " ".join(argv)))
+        fh.flush()
+        proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=fh, stderr=subprocess.STDOUT,
+                                start_new_session=True, close_fds=True)
+    write_json(MENU_RUN, {"pid": proc.pid, "label": label, "argv": argv, "start": now(),
+                          "marker": os.path.basename(__file__)})
+    rc = menu_follow(lambda: proc.poll())
+    try:
+        os.remove(P(MENU_RUN))
+    except OSError:
+        pass
+    with open(P(MENU_LAST), "a") as fh:
+        fh.write("\n%s  exit code %s\n" % (now(), rc))
+    with open(P(MENU_LOG), "a") as fh:
+        fh.write(read(MENU_LAST) + "\n")
+    ui.textbox(P(MENU_LAST), "%s: %s" % (label, "done" if rc == 0 else "stopped (code %s)" % rc))
+    return rc
+
+
+def menu_follow(poll, interval=0.3):
+    """Copy MENU_LAST to the terminal as it grows until poll() returns a code (not None)."""
+    import time
+    pos, rc = 0, None
+    while True:
+        rc = poll()
+        try:
+            with open(P(MENU_LAST), "rb") as fh:
+                fh.seek(pos)
+                chunk = fh.read()
+            pos += len(chunk)
+            if chunk:
+                sys.stdout.write(chunk.decode(errors="replace"))
+                sys.stdout.flush()
+        except OSError:
+            pass
+        if rc is not None:
+            return rc
+        time.sleep(interval)
+
+
+def cmd_menu(args):
+    ui = menu_ui()
+    run_info = load_json(MENU_RUN)
+    if run_info and pid_alive(run_info.get("pid"), run_info.get("marker")):
+        ui.clear()
+        say("== %s is still running (started %s) ==\n" % (run_info.get("label"), run_info.get("start")))
+        pid, marker = run_info["pid"], run_info.get("marker")
+        menu_follow(lambda: None if pid_alive(pid, marker) else 0, interval=1)
+        ui.textbox(P(MENU_LAST), "%s: finished" % run_info.get("label"))
+    if run_info:
+        try:
+            os.remove(P(MENU_RUN))
+        except OSError:
+            pass
+    while True:
+        st = load_json(STATE_DIR + "/state.json", {}) or {}
+        board = read(BOARD_FILE).strip()
+        steps, nxt = menu_steps(st, board)
+        if board not in (V1_BOARD, V3_BOARD):
+            ui.msgbox("This is for Batocera on PCs (x86_64 or x86-64-v3).\n\nThis system: %s" % (board or "unknown"))
+            return 2
+        head_text = "Board: %s    Step: %s\nNext: %s" % (
+            board, st.get("phase") or "start", next((l.split("  -")[0] for k, l, _, _ in steps if k == nxt), "-"))
+        choice = ui.menu(head_text, [(k, l) for k, l, _, _ in steps], default=nxt, cancel="Exit")
+        if choice is None:
+            return 0
+        key, label, argv, question = next(s for s in steps if s[0] == choice)
+        if key == "log":
+            if os.path.exists(P(MENU_LAST)):
+                ui.textbox(P(MENU_LAST), "Last result")
+            else:
+                ui.msgbox("Nothing has run from this menu yet.")
+            continue
+        if key == "backup":
+            targets = backup_targets()
+            dest = ui.menu("Where should the backup go? An external drive is safest.\n"
+                           "Needed: the files the scan found plus the boot partition (about 5 GB).",
+                           targets, default=targets[0][0])
+            if dest is None:
+                continue
+            argv = ["backup"] + (["--dest", dest] if dest != STATE_DIR + "/backups" else [])
+            question = "Back up to %s?\n\nThis can take a while on a slow drive." % dest
+        if question and not ui.yesno(question):
+            continue
+        rc = menu_run(ui, argv, label.split("  -")[0])
+        if key == "update-now" and rc == 0 and ui.yesno("The x86-64-v3 image is installed.\n\nReboot now?"):
+            if not TEST_MODE():
+                subprocess.run(["sync"])
+                subprocess.run(["reboot"])
+            return 0
+
+
 def main(argv=None):
     global ROOT, ASSUME_YES
     ap = argparse.ArgumentParser(prog="batocera_v3_migrate.py",
@@ -3154,6 +3552,9 @@ def main(argv=None):
     fx.add_argument("--apply", nargs="+", metavar="FIX",
                     help="hook-guard, launch-watchdog, hooks, hook-backups, xwayland-access, hook-unguard, or all")
     sub.add_parser("status")
+    la = sub.add_parser("launcher", help="add/remove 'V3 Migration' in ES's Ports list (controller menu)")
+    la.add_argument("action", nargs="?", choices=["install", "remove", "status"], default="status")
+    sub.add_parser("menu", help="the interactive menu the Ports launcher opens")
     pl = sub.add_parser("init-plugin", help="create an integration template")
     pl.add_argument("name")
     pl.add_argument("--force", action="store_true")
@@ -3173,7 +3574,8 @@ def main(argv=None):
     return {"scan": cmd_scan, "update": cmd_update, "integrate": cmd_integrate_all,
             "audit": cmd_audit, "verify-backup": cmd_verify_backup,
             "migrate": cmd_migrate, "check": cmd_integrate, "rollback": cmd_rollback,
-            "status": cmd_status, "fix": cmd_fix, "prepare": cmd_prepare, "unprepare": cmd_unprepare, "init-plugin": cmd_init_plugin}[args.cmd](args)
+            "status": cmd_status, "fix": cmd_fix, "prepare": cmd_prepare, "unprepare": cmd_unprepare, "init-plugin": cmd_init_plugin,
+            "launcher": cmd_launcher, "menu": cmd_menu}[args.cmd](args)
 
 
 if __name__ == "__main__":
