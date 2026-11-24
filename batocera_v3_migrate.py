@@ -3523,6 +3523,28 @@ def es_ok_button():
     return "a" if m and m.group(1).lower() == "true" else "b"
 
 
+ES_INPUT = "/userdata/system/configs/emulationstation/es_input.cfg"
+EV_POSITIONS = {"304": "south", "305": "east", "307": "north", "308": "west"}   # BTN_SOUTH/EAST/NORTH/WEST
+
+
+def es_button_positions(pad_names):
+    """Where ES's "a" and "b" sit on the connected pad ({"a": "east", ...}), from its es_input.cfg
+    entry (the evdev code recorded when the pad was configured). Empty if unknown."""
+    import xml.etree.ElementTree as ET
+    try:
+        root = ET.fromstring(read(ES_INPUT) or "<x/>")
+    except ET.ParseError:
+        return {}
+    for cfg in root.iter("inputConfig"):
+        if cfg.get("type") == "joystick" and cfg.get("deviceName") in pad_names:
+            out = {}
+            for inp in cfg.iter("input"):
+                if inp.get("name") in ("a", "b") and inp.get("code") in EV_POSITIONS:
+                    out[inp.get("name")] = EV_POSITIONS[inp.get("code")]
+            return out
+    return {}
+
+
 def launcher_keys(ok=None):
     """The Ports .keys map: ES's OK button -> Enter, its back button -> Esc, like ES itself."""
     ok = ok or es_ok_button()
@@ -4088,8 +4110,10 @@ class MigrateGui:
                   "mono": f(15, mono=True), "glyph": f(26, True), "key": f(14, True)}
         self.bg = self._background()
         self.clock = pg.time.Clock()
+        self.pad_names = []
         self.pad = os.environ.get("V3M_PAD") if os.environ.get("V3M_PAD") in GUI_PADS else self._pad_style()
         self.ok_btn = es_ok_button()
+        self.es_pos = es_button_positions(self.pad_names)
         self.script = list(script or [])
         self.shots, self.shot_n, self.next_inject = shots, 0, 0
 
@@ -4114,10 +4138,10 @@ class MigrateGui:
         pg = self.pg
         try:
             pg.joystick.init()
-            names = " ".join((pg.joystick.Joystick(i).get_name() or "").lower()
-                             for i in range(pg.joystick.get_count()))
+            self.pad_names = [pg.joystick.Joystick(i).get_name() or "" for i in range(pg.joystick.get_count())]
         except Exception:
-            names = ""
+            self.pad_names = []
+        names = " ".join(n.lower() for n in self.pad_names)
         if not names.strip():
             return "keyboard"
         if any(x in names for x in ("sony", "playstation", "dualsense", "dualshock")):
@@ -4196,6 +4220,19 @@ class MigrateGui:
         self.screen.blit(img, img.get_rect(center=r.center))
         return w
 
+    def button_names(self):
+        """Printed names of ES's OK and back buttons on the connected pad, from the positions ES's
+        own controller config gives them (es_input.cfg), plus page up/down."""
+        names = dict(GUI_PADS[self.pad])
+        if self.pad == "keyboard":
+            names.update(ok="Enter", back="Esc")
+            return names
+        back_btn = "a" if self.ok_btn == "b" else "b"
+        default = {"b": "south", "a": "east"}
+        pos = {k: self.es_pos.get(k, default[k]) for k in ("a", "b")}
+        names.update(ok=names.get(pos[self.ok_btn], "OK"), back=names.get(pos[back_btn], "Back"))
+        return names
+
     def footer(self, hints, status=""):
         """hints: [(button key in GUI_PADS, label)]"""
         pg = self.pg
@@ -4203,12 +4240,7 @@ class MigrateGui:
         pg.draw.rect(self.screen, GUI_FOOTER, (0, self.H - h, self.W, h))
         pg.draw.line(self.screen, (34, 45, 58), (0, self.H - h), (self.W, self.H - h), 1)
         y = self.H - h + (h - self.f["body"].get_height()) // 2
-        names = dict(GUI_PADS[self.pad])
-        if self.pad == "keyboard":
-            names.update(ok="Enter", back="Esc")
-        else:
-            ok_pos = "east" if self.ok_btn == "a" else "south"
-            names.update(ok=names[ok_pos], back=names["south" if ok_pos == "east" else "east"])
+        names = self.button_names()
         parts = []
         for key, label in hints:
             parts.append((names.get(key, key), label))
@@ -4340,11 +4372,13 @@ class MigrateGui:
         self.footer([("ok", "Select"), ("back", "Exit")], "x86-64-v3 Migration %s" % VERSION)
 
     def confirm(self, under, title, body, default_yes=True, labels=("Yes", "No")):
-        sel = 0 if default_yes else 1
+        """OK does the action, back backs out - the same two buttons as everywhere else in the menu
+        and in ES, so there is no highlight to move and nothing to mix up."""
+        pg = self.pg
+        names = self.button_names()
         while True:
             under()
             self.dim()
-            pg = self.pg
             w = min(self.W - 2 * self.s(120), self.s(860))
             lines = self.wrap(body, "body", w - 2 * self.s(28))
             lh = self.f["body"].get_height() + self.s(4)
@@ -4359,21 +4393,23 @@ class MigrateGui:
             for ln in lines:
                 self.text(ln, "body", GUI_FG, (x, y))
                 y += lh
-            bw = max(self.s(170), max(self.f["tile"].size(x)[0] for x in labels) + self.s(48))
             bh = self.s(56)
-            for i, lbl in enumerate(labels):
-                b = pg.Rect(0, 0, bw, bh)
-                b.bottomright = (panel.right - self.s(28) - (1 - i) * (bw + self.s(16)), panel.bottom - self.s(24))
-                self.tile(b, i == sel, radius=self.s(12))
-                img = self.f["tile"].render(lbl, True, GUI_FG)
-                self.screen.blit(img, img.get_rect(center=b.center))
-            self.footer([("ok", "Choose"), ("back", "Back")])
+            right = panel.right - self.s(28)
+            for key, lbl, accent in (("back", labels[1], False), ("ok", labels[0], True)):
+                gw = max(self.f["body"].get_height() + self.s(6), self.f["key"].size(names[key])[0] + self.s(14))
+                bw = self.s(24) + gw + self.s(12) + self.f["tile"].size(lbl)[0] + self.s(24)
+                btn = pg.Rect(0, 0, bw, bh)
+                btn.bottomright = (right, panel.bottom - self.s(24))
+                self.tile(btn, accent, radius=self.s(12))
+                gx = btn.x + self.s(24)
+                self.button_glyph(gx, btn.centery - self.f["body"].get_height() // 2, names[key])
+                self.text(lbl, "tile", GUI_FG, (gx + gw + self.s(12), btn.centery - self.f["tile"].get_height() // 2))
+                right = btn.x - self.s(16)
+            self.footer([("ok", labels[0]), ("back", labels[1])])
             for k in self.frame():
-                if k in ("left", "right", "up", "down"):
-                    sel = 1 - sel
-                elif k == "ok":
-                    return sel == 0
-                elif k in ("back", "quit"):
+                if k == "ok":
+                    return True
+                if k in ("back", "quit"):
                     return False
 
     def message(self, title, body):
