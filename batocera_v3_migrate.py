@@ -3483,8 +3483,9 @@ LAUNCHER_SRC = """#!/bin/bash
 %(mark)s
 # x86-64-v3 Migration menu, opened from ES's Ports list. Written by
 #   batocera_v3_migrate.py launcher install      (remove with: launcher remove)
-# Controller (through the .keys file): D-pad/stick move, OK = south button or Start,
-# back = east button or Select, L1/R1 = page up/down.
+# Controller (through the .keys file): D-pad/stick move, OK and back are the same buttons
+# as in ES (they follow "switch confirm & cancel buttons"), Start = OK, Select = back,
+# L1/R1 = page up/down.
 TOOL=%(tool)s
 for t in "$TOOL" %(places)s; do
     if [ -f "$t" ]; then TOOL="$t"; break; fi
@@ -3512,24 +3513,64 @@ curl -s -m 5 --data "x86-64-v3 Migration needs xterm, which this system lacks. O
 exit 1
 """
 
-# Batocera's names: b = confirm (south), a = back (east); same layout as BUA's ports.
-LAUNCHER_KEYS_SRC = {"actions_player1": [
-    {"trigger": "up", "type": "key", "target": "KEY_UP"},
-    {"trigger": "down", "type": "key", "target": "KEY_DOWN"},
-    {"trigger": "left", "type": "key", "target": "KEY_LEFT"},
-    {"trigger": "right", "type": "key", "target": "KEY_RIGHT"},
-    {"trigger": "joystick1up", "type": "key", "target": "KEY_UP"},
-    {"trigger": "joystick1down", "type": "key", "target": "KEY_DOWN"},
-    {"trigger": "joystick1left", "type": "key", "target": "KEY_LEFT"},
-    {"trigger": "joystick1right", "type": "key", "target": "KEY_RIGHT"},
-    {"trigger": "b", "type": "key", "target": "KEY_ENTER"},
-    {"trigger": "start", "type": "key", "target": "KEY_ENTER"},
-    {"trigger": "a", "type": "key", "target": "KEY_ESC"},
-    {"trigger": "select", "type": "key", "target": "KEY_ESC"},
-    {"trigger": "x", "type": "key", "target": "KEY_TAB"},
-    {"trigger": "pageup", "type": "key", "target": "KEY_PAGEUP"},
-    {"trigger": "pagedown", "type": "key", "target": "KEY_PAGEDOWN"},
-]}
+ES_SETTINGS = "/userdata/system/configs/emulationstation/es_settings.cfg"
+
+
+def es_ok_button():
+    """The pad button ES uses for OK: "b" (south), or "a" (east) when "switch confirm & cancel
+    buttons" (InvertButtons) is on - exactly as Batocera's EmulationStation decides it."""
+    m = re.search(r'<bool\s+name="InvertButtons"\s+value="(\w+)"', read(ES_SETTINGS))
+    return "a" if m and m.group(1).lower() == "true" else "b"
+
+
+def launcher_keys(ok=None):
+    """The Ports .keys map: ES's OK button -> Enter, its back button -> Esc, like ES itself."""
+    ok = ok or es_ok_button()
+    back = "a" if ok == "b" else "b"
+    return {"actions_player1": [
+        {"trigger": "up", "type": "key", "target": "KEY_UP"},
+        {"trigger": "down", "type": "key", "target": "KEY_DOWN"},
+        {"trigger": "left", "type": "key", "target": "KEY_LEFT"},
+        {"trigger": "right", "type": "key", "target": "KEY_RIGHT"},
+        {"trigger": "joystick1up", "type": "key", "target": "KEY_UP"},
+        {"trigger": "joystick1down", "type": "key", "target": "KEY_DOWN"},
+        {"trigger": "joystick1left", "type": "key", "target": "KEY_LEFT"},
+        {"trigger": "joystick1right", "type": "key", "target": "KEY_RIGHT"},
+        {"trigger": ok, "type": "key", "target": "KEY_ENTER"},
+        {"trigger": "start", "type": "key", "target": "KEY_ENTER"},
+        {"trigger": back, "type": "key", "target": "KEY_ESC"},
+        {"trigger": "select", "type": "key", "target": "KEY_ESC"},
+        {"trigger": "x", "type": "key", "target": "KEY_TAB"},
+        {"trigger": "pageup", "type": "key", "target": "KEY_PAGEUP"},
+        {"trigger": "pagedown", "type": "key", "target": "KEY_PAGEDOWN"},
+    ]}
+
+
+def launcher_keys_text(ok=None):
+    return json.dumps(launcher_keys(ok), indent=4) + "\n"
+
+
+def keys_ok_button():
+    """Which pad button the installed .keys file turns into Enter ("a"/"b"), or None."""
+    try:
+        acts = json.loads(read(LAUNCHER_KEYS) or "{}").get("actions_player1", [])
+    except ValueError:
+        return None
+    return next((x.get("trigger") for x in acts if x.get("target") == "KEY_ENTER"
+                 and x.get("trigger") in ("a", "b")), None)
+
+
+def keys_out_of_date():
+    """True when ES's OK/back buttons were switched since the .keys file was written. evmapy reads
+    that file when the port starts, so the fix (rewriting it) applies from the next start."""
+    loaded = keys_ok_button()
+    if not loaded or loaded == es_ok_button():
+        return False
+    try:
+        launcher_install()
+    except (OSError, RuntimeError):
+        pass
+    return True
 
 
 def tool_path():
@@ -3546,7 +3587,7 @@ def launcher_text(tool=None):
 def launcher_state():
     sh = read(LAUNCHER_SH)
     return {"installed": LAUNCHER_MARK in sh, "present": os.path.lexists(P(LAUNCHER_SH)),
-            "current": sh == launcher_text()}
+            "current": sh == launcher_text() and read(LAUNCHER_KEYS) == launcher_keys_text()}
 
 
 def es_reload_games():
@@ -3564,7 +3605,7 @@ def launcher_install(tag=None):
         raise RuntimeError("%s exists and was not written by this tool; not touching it" % LAUNCHER_SH)
     tag = tag or stamp()
     out = []
-    keys = json.dumps(LAUNCHER_KEYS_SRC, indent=4) + "\n"
+    keys = launcher_keys_text()
     for path, text, mode in ((LAUNCHER_SH, launcher_text(), 0o755), (LAUNCHER_KEYS, keys, 0o644)):
         if read(path) == text:
             continue
@@ -3933,6 +3974,11 @@ def _menu_follow(poll, interval, on_key):
 
 def cmd_menu(args):
     ui = menu_ui()
+    if keys_out_of_date():
+        ui.msgbox("ES's confirm and back buttons were switched since this menu was last opened, so the "
+                  "buttons here don't match ES yet.\n\nThat is fixed now: close this and open "
+                  "V3 Migration again.")
+        return 0
     run_info = step_running()
     if run_info:
         ui.clear()
@@ -4005,12 +4051,13 @@ GUI_TILE_COLORS = {"scan": (64, 116, 214), "backup": (136, 92, 214), "prepare": 
                    "status": (52, 138, 186), "log": (92, 148, 58), "drive": (64, 116, 214)}
 GUI_TILE_TEXT = {"scan": "1", "backup": "2", "prepare": "3", "update-now": "4", "unprepare": "↺",
                  "integrate": "4", "status": "i", "log": "≡", "drive": "▤"}
-# Button names per controller family. ES's "b" (south) is OK and "a" (east) is back,
-# which is what the launcher's .keys file turns into Enter and Esc.
-GUI_PADS = {"nintendo": {"ok": "B", "back": "A", "pgup": "L", "pgdn": "R"},
-            "xbox": {"ok": "A", "back": "B", "pgup": "LB", "pgdn": "RB"},
-            "playstation": {"ok": "✕", "back": "○", "pgup": "L1", "pgdn": "R1"},
-            "keyboard": {"ok": "Enter", "back": "Esc", "pgup": "PgUp", "pgdn": "PgDn"}}
+# What each controller family prints on its south and east buttons. ES's OK is the south button
+# (its "b"), or the east one ("a") when ES's confirm/cancel buttons are switched; the launcher's
+# .keys file turns OK into Enter and back into Esc to match.
+GUI_PADS = {"nintendo": {"south": "B", "east": "A", "pgup": "L", "pgdn": "R"},
+            "xbox": {"south": "A", "east": "B", "pgup": "LB", "pgdn": "RB"},
+            "playstation": {"south": "\u2715", "east": "\u25cb", "pgup": "L1", "pgdn": "R1"},
+            "keyboard": {"south": "Enter", "east": "Esc", "pgup": "PgUp", "pgdn": "PgDn"}}
 NO_CONFIRM_DEFAULT = ("update-now", "unprepare")   # these dialogs start on "No"
 CANCEL_NOTES = {
     "update-now": "If Batocera's upgrader has already started, it finishes first; then your previous boot "
@@ -4042,6 +4089,7 @@ class MigrateGui:
         self.bg = self._background()
         self.clock = pg.time.Clock()
         self.pad = os.environ.get("V3M_PAD") if os.environ.get("V3M_PAD") in GUI_PADS else self._pad_style()
+        self.ok_btn = es_ok_button()
         self.script = list(script or [])
         self.shots, self.shot_n, self.next_inject = shots, 0, 0
 
@@ -4155,7 +4203,12 @@ class MigrateGui:
         pg.draw.rect(self.screen, GUI_FOOTER, (0, self.H - h, self.W, h))
         pg.draw.line(self.screen, (34, 45, 58), (0, self.H - h), (self.W, self.H - h), 1)
         y = self.H - h + (h - self.f["body"].get_height()) // 2
-        names = GUI_PADS[self.pad]
+        names = dict(GUI_PADS[self.pad])
+        if self.pad == "keyboard":
+            names.update(ok="Enter", back="Esc")
+        else:
+            ok_pos = "east" if self.ok_btn == "a" else "south"
+            names.update(ok=names[ok_pos], back=names["south" if ok_pos == "east" else "east"])
         parts = []
         for key, label in hints:
             parts.append((names.get(key, key), label))
@@ -4463,6 +4516,11 @@ class MigrateGui:
                         ctl.request()
 
     def run(self):
+        if self.pad != "keyboard" and keys_out_of_date():
+            self.message(MENU_TITLE, "ES's confirm and back buttons were switched since this menu was last "
+                         "opened, so the buttons here don't match ES yet.\n\nThat is fixed now: close this "
+                         "and open V3 Migration again.")
+            return 0
         info = step_running()
         if info:
             pid, marker = info["pid"], info.get("marker")
