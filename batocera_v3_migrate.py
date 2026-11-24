@@ -36,6 +36,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import socket
 import stat
 import subprocess
@@ -260,6 +261,320 @@ def conf_set(key, value, path=BATOCERA_CONF):
     with open(tmp, "w") as f:
         f.write("\n".join(out) + "\n")
     os.replace(tmp, src)
+
+
+# --------------------------------------------------------------------------
+# step journal: a step started from the menu records how to undo each change
+# before making it, so Cancel (or a crash, or a power cut) can put everything back
+# --------------------------------------------------------------------------
+JOURNAL_DIR = STATE_DIR + "/journal"
+CANCEL_RC = 130
+JOURNAL = None
+_ORIG = {}
+
+
+class Journal:
+    def __init__(self, label):
+        self.root = P(JOURNAL_DIR)
+        self.label, self.ops, self.seen = label, [], set()
+        self.busy = False
+        self.critical_reason, self.cancel_pending = None, False
+        _ORIG["makedirs"](os.path.join(self.root, "files"), exist_ok=True)
+        self.save()
+
+    def mine(self, real):
+        return real == self.root or real.startswith(self.root + os.sep)
+
+    def save(self):
+        tmp = os.path.join(self.root, "journal.json.tmp")
+        with _ORIG["open"](tmp, "w") as fh:
+            json.dump({"label": self.label, "start": now(), "ops": self.ops}, fh)
+        _ORIG["replace"](tmp, os.path.join(self.root, "journal.json"))
+
+    def add(self, op):
+        self.ops.append(op)
+        self.save()
+
+    def file(self, path):
+        """Before a file is written, replaced, moved or removed: keep what it was."""
+        real = os.path.abspath(os.fsdecode(path))
+        if real in self.seen or self.mine(real) or os.path.isdir(real) and not os.path.islink(real):
+            return
+        self.seen.add(real)
+        self.busy = True
+        try:
+            if os.path.islink(real):
+                op = {"op": "file", "path": real, "link": os.readlink(real)}
+            elif os.path.exists(real):
+                copy = os.path.join(self.root, "files", str(len(self.ops)))
+                _ORIG["copy2"](real, copy)
+                op = {"op": "file", "path": real, "copy": copy}
+            else:
+                op = {"op": "file", "path": real, "absent": True}
+        finally:
+            self.busy = False
+        self.add(op)
+
+    def dirs(self, path):
+        """Before folders are created: note each one that doesn't exist yet."""
+        d, missing = os.path.abspath(os.fsdecode(path)), []
+        while d and not os.path.lexists(d) and d != os.path.dirname(d):
+            missing.append(d)
+            d = os.path.dirname(d)
+        for d in reversed(missing):
+            if d not in self.seen and not self.mine(d):
+                self.seen.add(d)
+                self.add({"op": "dir", "path": d})
+
+    def move(self, src, dst):
+        self.add({"op": "move", "src": os.path.abspath(os.fsdecode(src)), "dst": os.path.abspath(os.fsdecode(dst))})
+
+    def note(self, op):
+        self.add(op)
+
+    def discard(self):
+        _ORIG["rmtree"](self.root, ignore_errors=True)
+
+
+def _journaling():
+    return JOURNAL is not None and not JOURNAL.busy
+
+
+def _j_path(p):
+    return isinstance(p, (str, bytes, os.PathLike))
+
+
+def _jw_open(file, mode="r", *args, **kw):
+    if _journaling() and _j_path(file) and any(c in mode for c in "wax+"):
+        JOURNAL.file(file)
+    return _ORIG["open"](file, mode, *args, **kw)
+
+
+def _jw_two(name):
+    def wrapper(src, dst, *args, **kw):
+        if _journaling() and _j_path(src) and _j_path(dst):
+            if os.path.isdir(src) and not os.path.islink(src):
+                JOURNAL.dirs(os.path.dirname(os.path.abspath(os.fsdecode(dst))))
+                JOURNAL.move(src, dst)
+            else:
+                JOURNAL.file(src)
+                JOURNAL.file(dst)
+        return _ORIG[name](src, dst, *args, **kw)
+    return wrapper
+
+
+def _jw_one(name):
+    def wrapper(path, *args, **kw):
+        if _journaling() and _j_path(path):
+            JOURNAL.file(path)
+        return _ORIG[name](path, *args, **kw)
+    return wrapper
+
+
+def _jw_symlink(src, dst, *args, **kw):
+    if _journaling() and _j_path(dst):
+        JOURNAL.file(dst)
+    return _ORIG["symlink"](src, dst, *args, **kw)
+
+
+def _jw_mkdirs(name):
+    def wrapper(path, *args, **kw):
+        if _journaling() and _j_path(path):
+            JOURNAL.dirs(path)
+        return _ORIG[name](path, *args, **kw)
+    return wrapper
+
+
+def _jw_shmove(src, dst, *args, **kw):
+    if _journaling() and _j_path(src) and _j_path(dst):
+        real = os.path.join(dst, os.path.basename(os.fsdecode(src))) if os.path.isdir(dst) else dst
+        if os.path.isdir(src) and not os.path.islink(src):
+            JOURNAL.dirs(os.path.dirname(os.path.abspath(os.fsdecode(real))))
+            JOURNAL.move(src, real)
+            JOURNAL.busy = True              # the move's own renames are covered by the record above
+            try:
+                return _ORIG["shmove"](src, dst, *args, **kw)
+            finally:
+                JOURNAL.busy = False
+        JOURNAL.file(src)
+        JOURNAL.file(real)
+    return _ORIG["shmove"](src, dst, *args, **kw)
+
+
+def journal_start(label):
+    """Record every change this process makes from now on (see Journal)."""
+    global JOURNAL
+    import builtins
+    _ORIG.update({"open": builtins.open, "replace": os.replace, "rename": os.rename, "remove": os.remove,
+                  "unlink": os.unlink, "symlink": os.symlink, "chmod": os.chmod, "makedirs": os.makedirs,
+                  "mkdir": os.mkdir, "copy2": shutil.copy2, "shmove": shutil.move, "rmtree": shutil.rmtree})
+    JOURNAL = Journal(label)
+    builtins.open = _jw_open
+    os.replace, os.rename = _jw_two("replace"), _jw_two("rename")
+    os.remove, os.unlink, os.chmod = _jw_one("remove"), _jw_one("unlink"), _jw_one("chmod")
+    os.symlink = _jw_symlink
+    os.makedirs, os.mkdir = _jw_mkdirs("makedirs"), _jw_mkdirs("mkdir")
+    shutil.move = _jw_shmove
+    signal.signal(signal.SIGTERM, _on_cancel)
+    return JOURNAL
+
+
+def journal_stop(keep):
+    """Stop recording; keep the journal (cancelled: undo-step uses it) or drop it (step finished)."""
+    global JOURNAL
+    import builtins
+    if not _ORIG:
+        return
+    signal.signal(signal.SIGTERM, signal.SIG_DFL)
+    builtins.open = _ORIG["open"]
+    os.replace, os.rename, os.remove, os.unlink = _ORIG["replace"], _ORIG["rename"], _ORIG["remove"], _ORIG["unlink"]
+    os.symlink, os.chmod, os.makedirs, os.mkdir = _ORIG["symlink"], _ORIG["chmod"], _ORIG["makedirs"], _ORIG["mkdir"]
+    shutil.move = _ORIG["shmove"]
+    if JOURNAL and not keep:
+        JOURNAL.discard()
+    JOURNAL = None
+
+
+def _on_cancel(signum, frame):
+    if JOURNAL is not None and JOURNAL.critical_reason:
+        JOURNAL.cancel_pending = True     # finish the part that must not be cut short first
+        return
+    raise SystemExit(CANCEL_RC)
+
+
+class critical:
+    """A part that must not be cut short (writing /boot): Cancel waits for it to finish."""
+
+    def __init__(self, reason):
+        self.reason = reason
+
+    def __enter__(self):
+        if JOURNAL is not None:
+            JOURNAL.critical_reason = self.reason
+            with _ORIG["open"](os.path.join(JOURNAL.root, "critical"), "w") as fh:
+                fh.write(self.reason)
+        return self
+
+    def __exit__(self, et, ev, tb):
+        if JOURNAL is not None:
+            JOURNAL.critical_reason = None
+            try:
+                _ORIG["remove"](os.path.join(JOURNAL.root, "critical"))
+            except OSError:
+                pass
+            if JOURNAL.cancel_pending and et is None:
+                raise SystemExit(CANCEL_RC)
+        return False
+
+
+def _test_pause(point):
+    """Tests only: V3M_TEST_PAUSE=point:seconds holds a step at that point so it can be cancelled there."""
+    spec = os.environ.get("V3M_TEST_PAUSE", "")
+    if spec.split(":")[0] == point:
+        import time
+        time.sleep(float(spec.split(":")[1]))
+
+
+def journal_note(op):
+    if JOURNAL is not None:
+        JOURNAL.note(op)
+
+
+def journal_pending():
+    """The journal of a step that was cancelled or cut off, if one is waiting to be undone."""
+    return load_json(JOURNAL_DIR + "/journal.json")
+
+
+def journal_critical():
+    return read(JOURNAL_DIR + "/critical").strip()
+
+
+def _undo_safe_tree(path):
+    """Only folders a step created, and never a top-level one, are removed as a whole."""
+    rel = UNP(path)
+    parts = [x for x in rel.split("/") if x]
+    return len(parts) >= 3 and parts[0] in ("userdata", "media", "tmp", "boot") and \
+        not (parts[0] == "boot" and len(parts) < 3)
+
+
+def _on_boot(path):
+    return UNP(path) == "/boot" or UNP(path).startswith("/boot/")
+
+
+def undo_op(op, restart):
+    kind = op["op"]
+    if kind == "file":
+        path = op["path"]
+        boot = _on_boot(path)
+        if boot:
+            remount_boot(True)
+        try:
+            if op.get("absent"):
+                if os.path.lexists(path) and not (os.path.isdir(path) and not os.path.islink(path)):
+                    os.remove(path)
+                return
+            if os.path.lexists(path) and not (os.path.isdir(path) and not os.path.islink(path)):
+                os.remove(path)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            if "link" in op:
+                os.symlink(op["link"], path)
+            else:
+                shutil.copy2(op["copy"], path)
+        finally:
+            if boot:
+                remount_boot(False)
+    elif kind == "dir":
+        path = op["path"]
+        if os.path.isdir(path) and not os.path.islink(path):
+            if _undo_safe_tree(path):
+                shutil.rmtree(path)
+            else:
+                os.rmdir(path)
+    elif kind == "move":
+        if os.path.lexists(op["dst"]) and not os.path.lexists(op["src"]):
+            shutil.move(op["dst"], op["src"])
+    elif kind == "service_started":
+        script = "/userdata/system/services/" + op["name"]
+        if os.path.exists(P(script)):
+            run([script, "stop"], timeout=20)
+        if op.get("was_enabled"):
+            restart.append(op["name"])
+    elif kind == "mounted":
+        run(["umount", op["path"]], timeout=30)
+    elif kind == "boot_replaced":
+        say("  writing the previous boot partition back from %s ..." % op["backup"])
+        if not restore_boot(op["backup"]):
+            raise RuntimeError("could not restore the boot partition; use: rollback")
+
+
+def cmd_undo_step(args):
+    j = journal_pending()
+    if not j:
+        say("Nothing to undo.")
+        return 0
+    if getattr(args, "discard", False):
+        shutil.rmtree(P(JOURNAL_DIR), ignore_errors=True)
+        say("Kept the changes of '%s'; its undo record was removed." % j.get("label"))
+        return 0
+    ops = j.get("ops", [])
+    head("Putting back what '%s' changed (%d records)" % (j.get("label"), len(ops)))
+    restart, errors = [], []
+    for op in reversed(ops):
+        try:
+            undo_op(op, restart)
+        except Exception as e:  # keep going: everything else should still go back
+            errors.append("%s %s: %s" % (op["op"], UNP(op.get("path") or op.get("dst") or op.get("name") or ""), e))
+    for svc in restart:
+        run(["/userdata/system/services/" + svc, "start"], timeout=20)
+    if errors:
+        say("Could not put back:")
+        for e in errors:
+            say("  ! " + e)
+        say("\nThe undo record is kept; run this again (undo-step) after fixing the cause.")
+        return 1
+    shutil.rmtree(P(JOURNAL_DIR), ignore_errors=True)
+    say("Everything this step changed is back as it was before it started.")
+    return 0
 
 
 # --------------------------------------------------------------------------
@@ -1347,11 +1662,19 @@ def cmd_migrate(args):
     cmd = (["batocera-upgrade", "--media-upgrade", "--file", "/userdata/system/upgrade/boot.tar.xz"]
            if args.manual else ["batocera-upgrade", "--upgrade", "--url", url])
     say(" ".join(cmd))
-    if TEST_MODE():
-        say("(test mode) pretending the upgrade succeeded")
-        rc = 0
-    else:
-        rc = subprocess.call(cmd)
+    if JOURNAL is not None:
+        # a cancel writes the backed-up /boot back; these keep what they are now, not what the backup had
+        JOURNAL.file(P(OVERLAY))
+        JOURNAL.file(P(BOOT_CONF))
+    with critical("Batocera's upgrader installing the new system"):
+        if TEST_MODE():
+            say("(test mode) pretending the upgrade succeeded")
+            rc = 0
+        else:
+            rc = subprocess.call(cmd)
+        if rc == 0:
+            journal_note({"op": "boot_replaced", "backup": bdir})
+        _test_pause("upgrader")
     if rc != 0:
         say("batocera-upgrade failed (rc=%d). Your x86_64 system is unchanged; nothing else was touched." % rc)
         return 1
@@ -1384,20 +1707,23 @@ def park_for_v3(a, st, bdir, park, phase):
             actions["overlay_moved_to"] = UNP(bdir) + "/boot.tar (boot/overlay)"
             say("overlay already removed by the upgrade (original kept in boot.tar)")
         else:
-            remount_boot(True)
-            try:
-                shutil.copy2(P(OVERLAY), target)
-                if sha256_file(target) != a["boot"]["overlay"]["sha256"]:
-                    raise OSError("copy of overlay does not match")
-                os.remove(P(OVERLAY))
-                actions["overlay_moved_to"] = UNP(target)
-                say("overlay -> %s" % UNP(target))
-            except OSError as e:
-                actions["warnings"].append("could not move overlay: %s" % e)
-                say("WARNING: could not move the overlay (%s). Remove /boot/boot/overlay before "
-                    "rebooting; the original is in boot.tar." % e)
-            finally:
-                remount_boot(False)
+            with critical("moving the old overlay off the boot partition"):
+                remount_boot(True)
+                try:
+                    shutil.copy2(P(OVERLAY), target)
+                    if sha256_file(target) != a["boot"]["overlay"]["sha256"]:
+                        raise OSError("copy of overlay does not match")
+                    os.remove(P(OVERLAY))
+                    _test_pause("overlay-moved")
+                    actions["overlay_moved_to"] = UNP(target)
+                    say("overlay -> %s" % UNP(target))
+                except OSError as e:
+                    actions["warnings"].append("could not move overlay: %s" % e)
+                    say("WARNING: could not move the overlay (%s). Remove /boot/boot/overlay before "
+                        "rebooting; the original is in boot.tar." % e)
+                finally:
+                    remount_boot(False)
+    _test_pause("park-services")
     for svc in park:
         try:
             service_toggle(svc, False)
@@ -1459,12 +1785,13 @@ def cmd_unprepare(args):
     ma = st.get("migrate_actions") or {}
     moved = ma.get("overlay_moved_to") or ""
     if moved.endswith("overlay.x86_64") and os.path.exists(P(moved)):
-        remount_boot(True)
-        try:
-            shutil.copy2(P(moved), P(OVERLAY))
-            say("overlay restored")
-        finally:
-            remount_boot(False)
+        with critical("putting the overlay back on the boot partition"):
+            remount_boot(True)
+            try:
+                shutil.copy2(P(moved), P(OVERLAY))
+                say("overlay restored")
+            finally:
+                remount_boot(False)
     for svc in ma.get("parked_services", []):
         service_toggle(svc, True)
         say("re-enabled service %s" % svc)
@@ -1756,9 +2083,11 @@ def fix_xwayland_access(a, tag):
         with open(P(path), "w") as fh:
             fh.write(src)
         os.chmod(P(path), mode)
+    was = ACCESS_SERVICE in conf_parse().get("system.services", "").split()
     service_toggle(ACCESS_SERVICE, True)
     msg = ["installed %s and service %s (enabled)" % (GRANT_PATH, ACCESS_SERVICE)]
     if a["system"]["board"] == V3_BOARD and not TEST_MODE():
+        journal_note({"op": "service_started", "name": ACCESS_SERVICE, "was_enabled": was})
         rc, out = run(["/userdata/system/services/" + ACCESS_SERVICE, "start"], timeout=20)
         msg.append("started (log: /userdata/system/logs/xwayland-access.log)")
     return msg
@@ -2233,9 +2562,11 @@ def fix_launch_watchdog(a, tag):
         with open(P(path), "w") as fh:
             fh.write(src)
         os.chmod(P(path), 0o755)
+    was = watchdog_state()["enabled"]
     service_toggle(WATCHDOG_SERVICE, True)
     out = ["installed %s and service %s (enabled)" % (WATCHDOG_PATH, WATCHDOG_SERVICE)]
     if not TEST_MODE():
+        journal_note({"op": "service_started", "name": WATCHDOG_SERVICE, "was_enabled": was})
         run(["pkill", "-f", "launch_watchdog.py run"])
         run(["/userdata/system/services/" + WATCHDOG_SERVICE, "start"], timeout=20)
         out.append("started. Log: /userdata/system/logs/launch-watchdog.log")
@@ -2528,6 +2859,26 @@ def cmd_integrate(args):
 # --------------------------------------------------------------------------
 # rollback
 # --------------------------------------------------------------------------
+def restore_boot(bdir, verify=True):
+    """Write the boot partition saved in a backup back to /boot. False if the backup can't be used."""
+    boot_tar = os.path.join(P(bdir), "boot.tar")
+    if not os.path.exists(boot_tar) or (verify and not verify_backup_dir(P(bdir))):
+        say("  %s has no usable boot.tar" % bdir)
+        return False
+    with critical("writing the boot partition back"):
+        remount_boot(True)
+        try:
+            with tarfile.open(boot_tar) as t:
+                members = [x for x in t.getmembers() if x.name.startswith("boot")]
+                kw = {"filter": "fully_trusted"} if hasattr(tarfile, "fully_trusted_filter") else {}
+                t.extractall(P("/"), members=members, **kw)
+            if not TEST_MODE():
+                os.sync()
+        finally:
+            remount_boot(False)
+    return True
+
+
 def cmd_rollback(args):
     st = load_json(STATE_DIR + "/state.json", {}) or {}
     bdir = args.backup or st.get("backup_dir")
@@ -2548,15 +2899,7 @@ def cmd_rollback(args):
         say("It also restores /userdata/system/batocera.conf from that backup.")
     if not confirm("ROLLBACK", "Write the old boot partition back?"):
         return 1
-    remount_boot(True)
-    try:
-        with tarfile.open(boot_tar) as t:
-            members = [x for x in t.getmembers() if x.name.startswith("boot")]
-            kw = {"filter": "fully_trusted"} if hasattr(tarfile, "fully_trusted_filter") else {}
-            t.extractall(P("/"), members=members, **kw)
-        os.sync()
-    finally:
-        remount_boot(False)
+    restore_boot(bdir, verify=False)
     say("Boot partition restored.")
     if args.restore_config:
         sys_tar = os.path.join(P(bdir), "system.tar.gz")
@@ -2783,6 +3126,7 @@ def cmd_backup_simple(args):
                 try:
                     tar.add(src, arcname=UNP(src).lstrip("/"), recursive=False)
                     count += 1
+                    _test_pause("backup-file")
                 except OSError as e:
                     errors.append("%s: %s" % (UNP(src), e))
         manifest["archives"][fn] = {"set": name, "roots": roots[:50], "files": count,
@@ -2933,6 +3277,7 @@ def old_overlay_tree(st):
             os.makedirs(mnt, exist_ok=True)
             rc, out = run(["mount", "-o", "loop,ro", P(c), mnt], timeout=30)
             if rc == 0:
+                journal_note({"op": "mounted", "path": mnt})
                 return mnt, (lambda: run(["umount", mnt], timeout=30))
     if bdir and os.path.exists(P(bdir + "/boot.tar")):
         try:
@@ -3008,7 +3353,10 @@ def integrate_overlay(st, tag, done, manual):
                  "\n\nKEPT v3's VERSION (your old one is in the backup):\n" + "\n".join(conflicts) + "\n")
     if added:
         if which("batocera-save-overlay"):
-            rc, out = run(["batocera-save-overlay"], timeout=600)
+            if JOURNAL is not None:
+                JOURNAL.file(P(OVERLAY))
+            with critical("saving the new overlay to the boot partition"):
+                rc, out = run(["batocera-save-overlay"], timeout=600)
             done.append("old overlay: %d files restored and saved to a new v3 overlay%s"
                         % (len(added), "" if rc == 0 else " (save-overlay rc=%d: %s)" % (rc, out[-200:])))
         else:
@@ -3040,6 +3388,7 @@ def cmd_integrate_all(args):
             fn()
         except Exception as e:  # one step failing must not stop the rest
             manual.append("%s step failed: %s" % (name, e))
+        _test_pause("integrate-" + name)
 
     step("hook-backups", lambda: done.extend(fix_hook_backups(a, tag)) if a["hook_backups"] else None)
     step("hook-guard", lambda: done.extend(fix_hook_guard(a, tag)) if hook_guard_state()["direct_hooks"] else None)
@@ -3070,6 +3419,7 @@ def cmd_integrate_all(args):
             if m and any(("service %s " % m.group(1)) in x for x in manual):
                 continue  # already explained (X11 desktop)
             manual.append(i["title"])
+    _test_pause("integrate-checks")
     st = load_json(STATE_DIR + "/state.json", {}) or {}
     st["phase"] = "integrated" if not manual else "integrated-with-notes"
     write_json(STATE_DIR + "/state.json", st)
@@ -3410,16 +3760,19 @@ def menu_steps(st, board):
     return steps, nxt
 
 
-def step_start(argv, label):
+def step_start(argv, label, append=False):
     """Start one step of this tool in its own session, so closing the window (or the exit
-    hotkey) can't cut it off. Output goes to MENU_LAST. Returns the Popen."""
+    hotkey) can't cut it off, with a journal so it can be cancelled and undone.
+    Output goes to MENU_LAST. Returns the Popen."""
     os.makedirs(os.path.dirname(P(MENU_LAST)), exist_ok=True)
     os.makedirs(os.path.dirname(P(MENU_LOG)), exist_ok=True)
     cmd = [sys.executable, "-u", "-B", os.path.abspath(__file__), "--yes"]
     if TEST_MODE():
         cmd += ["--root", ROOT]
+    if argv[0] != "undo-step":
+        cmd += ["--journal"]
     cmd += argv
-    with open(P(MENU_LAST), "w") as fh:
+    with open(P(MENU_LAST), "a" if append else "w") as fh:
         fh.write("%s  %s: %s\n\n" % (now(), label, " ".join(argv)))
         fh.flush()
         proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=fh, stderr=subprocess.STDOUT,
@@ -3440,6 +3793,64 @@ def step_finish(rc):
         fh.write(read(MENU_LAST) + "\n")
 
 
+class StepCancel:
+    """Cancel for a running step: ask it to stop (it finishes any part that writes /boot first),
+    force it if it ignores that, then put back what it changed (undo-step).
+    tick() drives it; state is running / stopping / undoing / done."""
+    FORCE_AFTER = 20.0
+
+    def __init__(self, pid, poll):
+        import time
+        self.time = time
+        self.pid, self.poll = pid, poll
+        self.state, self.rc, self.undo_rc, self.undo = "running", None, None, None
+        self.asked = None
+
+    def request(self):
+        if self.state != "running":
+            return
+        self.state, self.asked = "stopping", self.time.time()
+        try:
+            os.kill(self.pid, signal.SIGTERM)
+        except OSError:
+            pass
+
+    def waiting_for(self):
+        return journal_critical() if self.state == "stopping" else ""
+
+    def tick(self):
+        if self.state in ("running", "stopping"):
+            rc = self.poll()
+            if rc is None:
+                if self.state == "stopping" and not journal_critical() and \
+                        self.time.time() - self.asked > self.FORCE_AFTER:
+                    try:
+                        os.killpg(self.pid, signal.SIGKILL)   # it ignored the request: stop it and its helpers
+                    except OSError:
+                        pass
+                return None
+            self.rc = rc
+            if self.state == "stopping" and journal_pending():
+                with open(P(MENU_LAST), "a") as fh:
+                    fh.write("\n%s  stopped (code %s)\n\n" % (now(), rc))
+                self.undo = step_start(["undo-step"], "Cancel: putting things back", append=True)
+                self.state = "undoing"
+                return None
+            self.state = "done"
+            return rc
+        if self.state == "undoing":
+            rc = self.undo.poll()
+            if rc is None:
+                return None
+            self.undo_rc, self.state = rc, "done"
+            return self.rc
+        return self.rc
+
+    @property
+    def cancelled(self):
+        return self.undo is not None
+
+
 def step_running():
     """The MENU_RUN record of a step that is still running (started by an earlier menu), or None."""
     info = load_json(MENU_RUN)
@@ -3454,18 +3865,48 @@ def step_running():
 
 
 def menu_run(ui, argv, label):
-    """Run one step, showing its output live; then show the result. Returns the exit code."""
+    """Run one step, showing its output live (Esc = cancel and put back); then show the result."""
     ui.clear()
-    say("== %s ==  (keep this window open; the step finishes even if it closes)\n" % label)
+    say("== %s ==  (Esc = cancel; the step finishes even if this window closes)\n" % label)
     proc = step_start(argv, label)
-    rc = menu_follow(lambda: proc.poll())
+    ctl = StepCancel(proc.pid, proc.poll)
+
+    def on_key(ch):
+        if ch == "\x1b" and ctl.state == "running" and ui.yesno(
+                "Cancel %s?\n\nIt stops and puts back everything this step changed, so your system is as "
+                "it was before you started it." % label):
+            ctl.request()
+            ui.clear()
+            say("== Cancelling %s: stopping, then putting back what it changed ==\n" % label)
+    rc = menu_follow(ctl.tick, on_key=on_key if argv[0] != "undo-step" else None)
     step_finish(rc)
-    ui.textbox(P(MENU_LAST), "%s: %s" % (label, "done" if rc == 0 else "stopped (code %s)" % rc))
+    if ctl.cancelled:
+        title = "%s: cancelled, %s" % (label, "all put back" if ctl.undo_rc == 0 else "undo incomplete")
+    else:
+        title = "%s: %s" % (label, "done" if rc == 0 else "stopped (code %s)" % rc)
+    ui.textbox(P(MENU_LAST), title)
     return rc
 
 
-def menu_follow(poll, interval=0.3):
-    """Copy MENU_LAST to the terminal as it grows until poll() returns a code (not None)."""
+def menu_follow(poll, interval=0.3, on_key=None):
+    """Copy MENU_LAST to the terminal as it grows until poll() returns a code (not None).
+    on_key(ch) gets keys typed meanwhile (terminal only)."""
+    tty = None
+    if on_key and sys.stdin.isatty():
+        import termios
+        import tty as _tty
+        tty = termios.tcgetattr(sys.stdin)
+        _tty.setcbreak(sys.stdin)
+    try:
+        return _menu_follow(poll, interval, on_key if tty else None)
+    finally:
+        if tty:
+            import termios
+            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, tty)
+
+
+def _menu_follow(poll, interval, on_key):
+    import select
     import time
     pos, rc = 0, None
     while True:
@@ -3482,7 +3923,12 @@ def menu_follow(poll, interval=0.3):
             pass
         if rc is not None:
             return rc
-        time.sleep(interval)
+        if on_key:
+            if select.select([sys.stdin], [], [], interval)[0]:
+                ch = os.read(sys.stdin.fileno(), 1).decode(errors="replace")
+                on_key(ch)
+        else:
+            time.sleep(interval)
 
 
 def cmd_menu(args):
@@ -3498,6 +3944,13 @@ def cmd_menu(args):
         except OSError:
             pass
         ui.textbox(P(MENU_LAST), "%s: finished" % run_info.get("label"))
+    j = journal_pending()
+    if j and not step_running():
+        if ui.yesno("The last step ('%s') didn't finish (cancelled, a power cut, or a crash).\n\n"
+                    "Put back what it changed?" % j.get("label")):
+            menu_run(ui, ["undo-step"], "Putting things back")
+        elif ui.yesno("Keep its changes instead? This can't be undone afterwards."):
+            menu_run(ui, ["undo-step", "--discard"], "Keeping the changes")
     while True:
         st = load_json(STATE_DIR + "/state.json", {}) or {}
         board = read(BOARD_FILE).strip()
@@ -3559,6 +4012,13 @@ GUI_PADS = {"nintendo": {"ok": "B", "back": "A", "pgup": "L", "pgdn": "R"},
             "playstation": {"ok": "✕", "back": "○", "pgup": "L1", "pgdn": "R1"},
             "keyboard": {"ok": "Enter", "back": "Esc", "pgup": "PgUp", "pgdn": "PgDn"}}
 NO_CONFIRM_DEFAULT = ("update-now", "unprepare")   # these dialogs start on "No"
+CANCEL_NOTES = {
+    "update-now": "If Batocera's upgrader has already started, it finishes first; then your previous boot "
+                  "partition is written back from the backup.",
+    "integrate": "If the new overlay was already saved, the previous one is put back on the boot partition.",
+    "prepare": "If the overlay is being moved, that finishes first; then it is put back.",
+    "backup": "The unfinished backup is deleted.",
+}
 
 
 class MigrateGui:
@@ -3826,7 +4286,7 @@ class MigrateGui:
         self.rows(items, idx, top, lambda i: ("NEXT", GUI_ACCENT) if steps[i][0] == nxt else None)
         self.footer([("ok", "Select"), ("back", "Exit")], "x86-64-v3 Migration %s" % VERSION)
 
-    def confirm(self, under, title, body, default_yes=True):
+    def confirm(self, under, title, body, default_yes=True, labels=("Yes", "No")):
         sel = 0 if default_yes else 1
         while True:
             under()
@@ -3846,14 +4306,15 @@ class MigrateGui:
             for ln in lines:
                 self.text(ln, "body", GUI_FG, (x, y))
                 y += lh
-            bw, bh = self.s(170), self.s(56)
-            for i, lbl in enumerate(("Yes", "No")):
+            bw = max(self.s(170), max(self.f["tile"].size(x)[0] for x in labels) + self.s(48))
+            bh = self.s(56)
+            for i, lbl in enumerate(labels):
                 b = pg.Rect(0, 0, bw, bh)
                 b.bottomright = (panel.right - self.s(28) - (1 - i) * (bw + self.s(16)), panel.bottom - self.s(24))
                 self.tile(b, i == sel, radius=self.s(12))
                 img = self.f["tile"].render(lbl, True, GUI_FG)
                 self.screen.blit(img, img.get_rect(center=b.center))
-            self.footer([("ok", "Choose"), ("back", "Cancel")])
+            self.footer([("ok", "Choose"), ("back", "Back")])
             for k in self.frame():
                 if k in ("left", "right", "up", "down"):
                     sel = 1 - sel
@@ -3907,31 +4368,41 @@ class MigrateGui:
             out.pop()
         return out
 
-    def watch(self, label, poll, attached=False, static=False):
-        """Show a running step's output live, then its result. Returns the exit code."""
+    def watch(self, label, poll, attached=False, static=False, pid=None, cancel_text=""):
+        """Show a step's output live, then its result; with pid, B/Esc offers Cancel
+        (stop + put back what it changed). Returns the step's exit code."""
         pg = self.pg
-        t0 = pg.time.get_ticks()
+        t0, t_end = pg.time.get_ticks(), None
+        ctl = StepCancel(pid, poll) if pid else None
         rc, follow, offset = None, True, 0
+        view = {"offset": 0, "follow": True, "vis": 1, "most": 0}
         self.busy = True
-        while True:
-            if rc is None:
-                rc = poll()
-                if rc is not None:
-                    self.busy = False
-                    t_end = pg.time.get_ticks()
+
+        def draw():
             self.screen.blit(self.bg, (0, 0))
-            secs = ((t_end if rc is not None else pg.time.get_ticks()) - t0) // 1000
+            secs = ((t_end or pg.time.get_ticks()) - t0) // 1000
+            state = ctl.state if ctl else ("done" if rc is not None else "running")
             if static:
                 sub = "Full log: %s" % MENU_LOG
-            elif rc is None:
+            elif state == "running":
                 sub = "Running %d:%02d  -  it keeps going even if this window closes" % (secs // 60, secs % 60)
+            elif state == "stopping":
+                w = ctl.waiting_for()
+                sub = ("Stopping once this part is done (it must not be cut short): %s" % w) if w else "Stopping..."
+            elif state == "undoing":
+                sub = "Putting back what it changed..."
             else:
                 sub = "Finished in %d:%02d. Full log: %s" % (secs // 60, secs % 60, MENU_LOG)
             top = self.header(label, sub)
-            if rc is None:
+            if state in ("running", "stopping", "undoing"):
                 self.spinner((self.W - self.s(70), self.s(52)), self.s(16))
             elif static:
                 pass
+            elif ctl and ctl.cancelled:
+                if ctl.undo_rc == 0:
+                    self.chip("Cancelled - all put back", (196, 140, 40), right_top=(self.W - self.s(48), self.s(34)))
+                else:
+                    self.chip("Cancelled - undo incomplete", GUI_DANGER, right_top=(self.W - self.s(48), self.s(34)))
             elif rc == 0:
                 self.chip("Done", GUI_SUCCESS, right_top=(self.W - self.s(48), self.s(34)))
             else:
@@ -3943,41 +4414,65 @@ class MigrateGui:
             lh = self.f["mono"].get_height() + self.s(2)
             vis = max(1, (box.h - 2 * self.s(14)) // lh)
             most = max(0, len(lines) - vis)
-            offset = most if follow else max(0, min(offset, most))
+            view["offset"] = most if view["follow"] else max(0, min(view["offset"], most))
+            view["vis"], view["most"] = vis, most
             y = box.y + self.s(14)
-            for ln in lines[offset:offset + vis]:
+            for ln in lines[view["offset"]:view["offset"] + vis]:
                 color = GUI_DANGER if re.match(r"\s*(!|BLOCKER|STOP|ERROR|FAIL)", ln) else \
                     GUI_SUCCESS if re.match(r"\s*\+ ", ln) else GUI_FG
                 self.text(ln, "mono", color, (box.x + self.s(18), y))
                 y += lh
             if most:
                 bar_h = max(self.s(24), box.h * vis // len(lines))
-                bar_y = box.y + (box.h - bar_h) * offset // most
+                bar_y = box.y + (box.h - bar_h) * view["offset"] // most
                 pg.draw.rect(self.screen, (60, 76, 96), (box.right - self.s(8), bar_y, self.s(4), bar_h),
                              border_radius=self.s(2))
-            hints = ([("ok", "Back")] if rc is not None else []) + [("pgup", "Page up"), ("pgdn", "Page down")]
-            self.footer(hints, "Started from this menu earlier" if attached else "")
+            if state == "done" or static:
+                hints = [("ok", "Back")]
+            elif state == "running" and ctl:
+                hints = [("back", "Cancel")]
+            else:
+                hints = []
+            self.footer(hints + [("pgup", "Page up"), ("pgdn", "Page down")],
+                        "Started from this menu earlier" if attached else "")
+
+        while True:
+            if rc is None:
+                rc = ctl.tick() if ctl else poll()
+                if rc is not None:
+                    self.busy = False
+                    t_end = pg.time.get_ticks()
+            draw()
             for k in self.frame():
                 if k in ("up", "pgup", "home"):
-                    follow = False
-                    offset = max(0, offset - (1 if k == "up" else vis if k == "pgup" else most))
+                    view["follow"] = False
+                    view["offset"] = max(0, view["offset"] - (1 if k == "up" else view["vis"] if k == "pgup"
+                                                              else view["most"]))
                 elif k in ("down", "pgdn", "end"):
-                    offset = min(most, offset + (1 if k == "down" else vis if k == "pgdn" else most))
-                    follow = offset >= most
-                elif k in ("ok", "back") and rc is not None:
+                    view["offset"] = min(view["most"], view["offset"] + (1 if k == "down" else view["vis"]
+                                                                         if k == "pgdn" else view["most"]))
+                    view["follow"] = view["offset"] >= view["most"]
+                elif rc is not None and k in ("ok", "back", "quit"):
                     return rc
-                elif k == "quit" and rc is not None:
-                    return rc
+                elif rc is None and k == "back" and ctl and ctl.state == "running":
+                    if self.confirm(draw, "Cancel %s?" % label,
+                                    "It stops and puts back everything this step changed, so your system is "
+                                    "as it was before you started it." + (("\n\n" + cancel_text) if cancel_text
+                                                                         else ""), default_yes=False,
+                                    labels=("Stop and undo", "Keep going")):
+                        ctl.request()
 
     def run(self):
         info = step_running()
         if info:
             pid, marker = info["pid"], info.get("marker")
-            self.watch(info.get("label") or "Step", lambda: None if pid_alive(pid, marker) else 0, attached=True)
+            self.watch(info.get("label") or "Step", lambda: None if pid_alive(pid, marker) else 0, attached=True,
+                       pid=pid if (info.get("argv") or [""])[0] != "undo-step" else None)
             try:
                 os.remove(P(MENU_RUN))
             except OSError:
                 pass
+        self.offer_undo()
         idx, last_nxt = 0, object()
         while True:
             st = load_json(STATE_DIR + "/state.json", {}) or {}
@@ -4006,6 +4501,25 @@ class MigrateGui:
                     last_nxt = object()  # re-select the (new) next step
                     break
 
+    def offer_undo(self):
+        """A step was cut off last time (power cut, crash, forced stop): offer to put things back."""
+        j = journal_pending()
+        if not j or step_running():
+            return
+        blank = lambda: self.screen.blit(self.bg, (0, 0))
+        while True:
+            if self.confirm(blank, "The last step didn't finish",
+                            "'%s' was stopped before it finished (cancelled, a power cut, or a crash), and "
+                            "some of its changes are still in place.\n\nPut back what it changed?" % j.get("label")):
+                proc = step_start(["undo-step"], "Putting things back")
+                step_finish(self.watch("Putting things back", proc.poll))
+                return
+            if self.confirm(blank, "Keep its changes?", "The system stays as the unfinished step left it, and "
+                                                         "this can't be undone afterwards.", default_yes=False):
+                proc = step_start(["undo-step", "--discard"], "Keeping the changes")
+                step_finish(self.watch("Keeping the changes", proc.poll))
+                return
+
     def choose(self, step, st, board):
         key, label, argv, question = step
         title = label.split("  - ")[0]
@@ -4026,7 +4540,7 @@ class MigrateGui:
         if question and not self.confirm(under, title, question, default_yes=key not in NO_CONFIRM_DEFAULT):
             return None
         proc = step_start(argv, title)
-        rc = self.watch(title, proc.poll)
+        rc = self.watch(title, proc.poll, pid=proc.pid, cancel_text=CANCEL_NOTES.get(key, ""))
         step_finish(rc)
         if key == "update-now" and rc == 0 and self.confirm(lambda: self.screen.blit(self.bg, (0, 0)),
                                                              "Reboot now?", "The x86-64-v3 image is installed. "
@@ -4070,6 +4584,7 @@ def main(argv=None):
                                  description="Safe Batocera x86_64 -> x86-64-v3 migration (v%s)" % VERSION)
     ap.add_argument("--yes", action="store_true", help="don't ask for typed confirmations")
     ap.add_argument("--root", default="/", help=argparse.SUPPRESS)  # testing against a mock tree
+    ap.add_argument("--journal", action="store_true", help=argparse.SUPPRESS)  # set by the menu: makes Cancel possible
     sub = ap.add_subparsers(dest="cmd")
     sub.add_parser("scan", help="1. find everything the x86-64-v3 update affects")
     b = sub.add_parser("backup", help="2. back up those things (+ boot partition for rollback)")
@@ -4106,6 +4621,8 @@ def main(argv=None):
     fx.add_argument("--apply", nargs="+", metavar="FIX",
                     help="hook-guard, launch-watchdog, hooks, hook-backups, xwayland-access, hook-unguard, or all")
     sub.add_parser("status")
+    un = sub.add_parser("undo-step", help="put back what a cancelled or interrupted menu step changed")
+    un.add_argument("--discard", action="store_true", help="keep the changes; just drop the undo record")
     la = sub.add_parser("launcher", help="add/remove 'V3 Migration' in ES's Ports list (controller menu)")
     la.add_argument("action", nargs="?", choices=["install", "remove", "status"], default="status")
     sub.add_parser("menu", help="the terminal menu (the launcher's fallback when the full-screen menu can't start)")
@@ -4119,6 +4636,30 @@ def main(argv=None):
     args = ap.parse_args(argv)
     ROOT = os.path.abspath(args.root)
     ASSUME_YES = args.yes
+    read_only = args.cmd in ("status", "audit", "verify-backup", "undo-step", "menu", "gui", "init-plugin") or \
+        (args.cmd == "launcher" and args.action == "status") or (args.cmd == "fix" and not args.apply) or \
+        (args.cmd == "check" and not args.apply)
+    if not read_only and journal_pending():
+        say("A cancelled or interrupted step left changes behind; nothing else can change until they are dealt "
+            "with.\nRun: undo-step   (or: undo-step --discard to keep them)")
+        return 2
+    if args.journal and args.cmd not in (None, "undo-step", "menu", "gui", "launcher"):
+        journal_start(args.cmd)
+        cancelled = False
+        try:
+            return dispatch(args)
+        except SystemExit as e:
+            if e.code != CANCEL_RC:
+                raise
+            cancelled = True
+            say("\nCancelled. Putting back what this step changed...")
+            return CANCEL_RC
+        finally:
+            journal_stop(keep=cancelled)
+    return dispatch(args)
+
+
+def dispatch(args):
     if not args.cmd:
         return cmd_auto(args)
     if args.cmd == "backup":
@@ -4133,7 +4674,7 @@ def main(argv=None):
             "audit": cmd_audit, "verify-backup": cmd_verify_backup,
             "migrate": cmd_migrate, "check": cmd_integrate, "rollback": cmd_rollback,
             "status": cmd_status, "fix": cmd_fix, "prepare": cmd_prepare, "unprepare": cmd_unprepare, "init-plugin": cmd_init_plugin,
-            "launcher": cmd_launcher, "menu": cmd_menu, "gui": cmd_gui}[args.cmd](args)
+            "launcher": cmd_launcher, "menu": cmd_menu, "gui": cmd_gui, "undo-step": cmd_undo_step}[args.cmd](args)
 
 
 if __name__ == "__main__":

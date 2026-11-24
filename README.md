@@ -31,7 +31,11 @@ This adds **V3 Migration** to ES's **Ports** list, so every step can be run from
 - **After the update, on v3:** Integrate (safe to repeat).
 - **Any time:** Status and Last result.
 
-Each step asks Yes/No first, shows its output live, then shows the result. A step keeps running even if the menu is closed; opening it again follows the step to the end. Output is kept in `/userdata/system/logs/v3-migrate-menu.log`. Rollback is not in the menu: it rewrites the boot partition, so it stays an SSH command.
+Each step asks Yes/No first, shows its output live, then shows the result. A step keeps running even if the menu is closed; opening it again follows the step to the end.
+
+**Cancel.** While a step runs, the back button (B on Xbox pads, A on Nintendo pads, Esc in the terminal menu) offers **Stop and undo**. The step stops and everything it changed is put back, so the system is as it was before the step started: files are restored byte for byte (permissions and links too), new files and folders are removed, a half-written backup is deleted, services it started are stopped, and a moved or saved overlay goes back. While a step runs from the menu it records how to undo each change *before* making it, in `/userdata/system/v3-migration/journal`, so this also works after a forced stop, a crash or a power cut: the menu offers to put things back the next time it opens (or run `undo-step` over SSH; `undo-step --discard` keeps the changes instead). Until that is decided, the tool won't start anything else that changes the system.
+
+A few parts can't be cut short safely: moving the overlay off the boot partition, saving the new overlay, and Batocera's upgrader. If you cancel during one of them, the menu says so, lets it finish, then undoes. Cancelling **Update now** after the upgrader has run writes the previous boot partition back from your backup. Output is kept in `/userdata/system/logs/v3-migrate-menu.log`. Rollback is not in the menu: it rewrites the boot partition, so it stays an SSH command.
 
 Controller: D-pad or left stick moves, the south button (B on Nintendo pads, A on Xbox, Cross on PlayStation) or **Start** selects, the east button or **Select** goes back, **L1/R1** page through output. The button hints match the connected pad. The menu uses pygame, as the BUA app does; if it can't start, the launcher opens a terminal menu (`dialog` in xterm) with the same steps instead. Remove the entry with `launcher remove`. `integrate` refreshes an installed launcher.
 
