@@ -21,6 +21,8 @@ Phases (run in order, all on the Batocera box over SSH):
   rollback       put the backed-up x86_64 boot partition back
   status         show where you are
   init-plugin    write an integration template for something custom
+  launcher       install|remove "V3 Migration" in ES's Ports list: a menu for
+                 all of the above that works with a controller (`menu`)
 
 Every command that changes something asks for a typed confirmation unless
 --yes is given, and every file it edits is copied first.
@@ -34,6 +36,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import socket
 import stat
 import subprocess
@@ -41,7 +44,7 @@ import sys
 import tarfile
 import urllib.request
 
-VERSION = "2.0.1"
+VERSION = "2.1.0"
 
 # --------------------------------------------------------------------------
 # paths (everything goes through P() so the tool can be tested on a mock tree)
@@ -258,6 +261,320 @@ def conf_set(key, value, path=BATOCERA_CONF):
     with open(tmp, "w") as f:
         f.write("\n".join(out) + "\n")
     os.replace(tmp, src)
+
+
+# --------------------------------------------------------------------------
+# step journal: a step started from the menu records how to undo each change
+# before making it, so Cancel (or a crash, or a power cut) can put everything back
+# --------------------------------------------------------------------------
+JOURNAL_DIR = STATE_DIR + "/journal"
+CANCEL_RC = 130
+JOURNAL = None
+_ORIG = {}
+
+
+class Journal:
+    def __init__(self, label):
+        self.root = P(JOURNAL_DIR)
+        self.label, self.ops, self.seen = label, [], set()
+        self.busy = False
+        self.critical_reason, self.cancel_pending = None, False
+        _ORIG["makedirs"](os.path.join(self.root, "files"), exist_ok=True)
+        self.save()
+
+    def mine(self, real):
+        return real == self.root or real.startswith(self.root + os.sep)
+
+    def save(self):
+        tmp = os.path.join(self.root, "journal.json.tmp")
+        with _ORIG["open"](tmp, "w") as fh:
+            json.dump({"label": self.label, "start": now(), "ops": self.ops}, fh)
+        _ORIG["replace"](tmp, os.path.join(self.root, "journal.json"))
+
+    def add(self, op):
+        self.ops.append(op)
+        self.save()
+
+    def file(self, path):
+        """Before a file is written, replaced, moved or removed: keep what it was."""
+        real = os.path.abspath(os.fsdecode(path))
+        if real in self.seen or self.mine(real) or os.path.isdir(real) and not os.path.islink(real):
+            return
+        self.seen.add(real)
+        self.busy = True
+        try:
+            if os.path.islink(real):
+                op = {"op": "file", "path": real, "link": os.readlink(real)}
+            elif os.path.exists(real):
+                copy = os.path.join(self.root, "files", str(len(self.ops)))
+                _ORIG["copy2"](real, copy)
+                op = {"op": "file", "path": real, "copy": copy}
+            else:
+                op = {"op": "file", "path": real, "absent": True}
+        finally:
+            self.busy = False
+        self.add(op)
+
+    def dirs(self, path):
+        """Before folders are created: note each one that doesn't exist yet."""
+        d, missing = os.path.abspath(os.fsdecode(path)), []
+        while d and not os.path.lexists(d) and d != os.path.dirname(d):
+            missing.append(d)
+            d = os.path.dirname(d)
+        for d in reversed(missing):
+            if d not in self.seen and not self.mine(d):
+                self.seen.add(d)
+                self.add({"op": "dir", "path": d})
+
+    def move(self, src, dst):
+        self.add({"op": "move", "src": os.path.abspath(os.fsdecode(src)), "dst": os.path.abspath(os.fsdecode(dst))})
+
+    def note(self, op):
+        self.add(op)
+
+    def discard(self):
+        _ORIG["rmtree"](self.root, ignore_errors=True)
+
+
+def _journaling():
+    return JOURNAL is not None and not JOURNAL.busy
+
+
+def _j_path(p):
+    return isinstance(p, (str, bytes, os.PathLike))
+
+
+def _jw_open(file, mode="r", *args, **kw):
+    if _journaling() and _j_path(file) and any(c in mode for c in "wax+"):
+        JOURNAL.file(file)
+    return _ORIG["open"](file, mode, *args, **kw)
+
+
+def _jw_two(name):
+    def wrapper(src, dst, *args, **kw):
+        if _journaling() and _j_path(src) and _j_path(dst):
+            if os.path.isdir(src) and not os.path.islink(src):
+                JOURNAL.dirs(os.path.dirname(os.path.abspath(os.fsdecode(dst))))
+                JOURNAL.move(src, dst)
+            else:
+                JOURNAL.file(src)
+                JOURNAL.file(dst)
+        return _ORIG[name](src, dst, *args, **kw)
+    return wrapper
+
+
+def _jw_one(name):
+    def wrapper(path, *args, **kw):
+        if _journaling() and _j_path(path):
+            JOURNAL.file(path)
+        return _ORIG[name](path, *args, **kw)
+    return wrapper
+
+
+def _jw_symlink(src, dst, *args, **kw):
+    if _journaling() and _j_path(dst):
+        JOURNAL.file(dst)
+    return _ORIG["symlink"](src, dst, *args, **kw)
+
+
+def _jw_mkdirs(name):
+    def wrapper(path, *args, **kw):
+        if _journaling() and _j_path(path):
+            JOURNAL.dirs(path)
+        return _ORIG[name](path, *args, **kw)
+    return wrapper
+
+
+def _jw_shmove(src, dst, *args, **kw):
+    if _journaling() and _j_path(src) and _j_path(dst):
+        real = os.path.join(dst, os.path.basename(os.fsdecode(src))) if os.path.isdir(dst) else dst
+        if os.path.isdir(src) and not os.path.islink(src):
+            JOURNAL.dirs(os.path.dirname(os.path.abspath(os.fsdecode(real))))
+            JOURNAL.move(src, real)
+            JOURNAL.busy = True              # the move's own renames are covered by the record above
+            try:
+                return _ORIG["shmove"](src, dst, *args, **kw)
+            finally:
+                JOURNAL.busy = False
+        JOURNAL.file(src)
+        JOURNAL.file(real)
+    return _ORIG["shmove"](src, dst, *args, **kw)
+
+
+def journal_start(label):
+    """Record every change this process makes from now on (see Journal)."""
+    global JOURNAL
+    import builtins
+    _ORIG.update({"open": builtins.open, "replace": os.replace, "rename": os.rename, "remove": os.remove,
+                  "unlink": os.unlink, "symlink": os.symlink, "chmod": os.chmod, "makedirs": os.makedirs,
+                  "mkdir": os.mkdir, "copy2": shutil.copy2, "shmove": shutil.move, "rmtree": shutil.rmtree})
+    JOURNAL = Journal(label)
+    builtins.open = _jw_open
+    os.replace, os.rename = _jw_two("replace"), _jw_two("rename")
+    os.remove, os.unlink, os.chmod = _jw_one("remove"), _jw_one("unlink"), _jw_one("chmod")
+    os.symlink = _jw_symlink
+    os.makedirs, os.mkdir = _jw_mkdirs("makedirs"), _jw_mkdirs("mkdir")
+    shutil.move = _jw_shmove
+    signal.signal(signal.SIGTERM, _on_cancel)
+    return JOURNAL
+
+
+def journal_stop(keep):
+    """Stop recording; keep the journal (cancelled: undo-step uses it) or drop it (step finished)."""
+    global JOURNAL
+    import builtins
+    if not _ORIG:
+        return
+    signal.signal(signal.SIGTERM, signal.SIG_DFL)
+    builtins.open = _ORIG["open"]
+    os.replace, os.rename, os.remove, os.unlink = _ORIG["replace"], _ORIG["rename"], _ORIG["remove"], _ORIG["unlink"]
+    os.symlink, os.chmod, os.makedirs, os.mkdir = _ORIG["symlink"], _ORIG["chmod"], _ORIG["makedirs"], _ORIG["mkdir"]
+    shutil.move = _ORIG["shmove"]
+    if JOURNAL and not keep:
+        JOURNAL.discard()
+    JOURNAL = None
+
+
+def _on_cancel(signum, frame):
+    if JOURNAL is not None and JOURNAL.critical_reason:
+        JOURNAL.cancel_pending = True     # finish the part that must not be cut short first
+        return
+    raise SystemExit(CANCEL_RC)
+
+
+class critical:
+    """A part that must not be cut short (writing /boot): Cancel waits for it to finish."""
+
+    def __init__(self, reason):
+        self.reason = reason
+
+    def __enter__(self):
+        if JOURNAL is not None:
+            JOURNAL.critical_reason = self.reason
+            with _ORIG["open"](os.path.join(JOURNAL.root, "critical"), "w") as fh:
+                fh.write(self.reason)
+        return self
+
+    def __exit__(self, et, ev, tb):
+        if JOURNAL is not None:
+            JOURNAL.critical_reason = None
+            try:
+                _ORIG["remove"](os.path.join(JOURNAL.root, "critical"))
+            except OSError:
+                pass
+            if JOURNAL.cancel_pending and et is None:
+                raise SystemExit(CANCEL_RC)
+        return False
+
+
+def _test_pause(point):
+    """Tests only: V3M_TEST_PAUSE=point:seconds holds a step at that point so it can be cancelled there."""
+    spec = os.environ.get("V3M_TEST_PAUSE", "")
+    if spec.split(":")[0] == point:
+        import time
+        time.sleep(float(spec.split(":")[1]))
+
+
+def journal_note(op):
+    if JOURNAL is not None:
+        JOURNAL.note(op)
+
+
+def journal_pending():
+    """The journal of a step that was cancelled or cut off, if one is waiting to be undone."""
+    return load_json(JOURNAL_DIR + "/journal.json")
+
+
+def journal_critical():
+    return read(JOURNAL_DIR + "/critical").strip()
+
+
+def _undo_safe_tree(path):
+    """Only folders a step created, and never a top-level one, are removed as a whole."""
+    rel = UNP(path)
+    parts = [x for x in rel.split("/") if x]
+    return len(parts) >= 3 and parts[0] in ("userdata", "media", "tmp", "boot") and \
+        not (parts[0] == "boot" and len(parts) < 3)
+
+
+def _on_boot(path):
+    return UNP(path) == "/boot" or UNP(path).startswith("/boot/")
+
+
+def undo_op(op, restart):
+    kind = op["op"]
+    if kind == "file":
+        path = op["path"]
+        boot = _on_boot(path)
+        if boot:
+            remount_boot(True)
+        try:
+            if op.get("absent"):
+                if os.path.lexists(path) and not (os.path.isdir(path) and not os.path.islink(path)):
+                    os.remove(path)
+                return
+            if os.path.lexists(path) and not (os.path.isdir(path) and not os.path.islink(path)):
+                os.remove(path)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            if "link" in op:
+                os.symlink(op["link"], path)
+            else:
+                shutil.copy2(op["copy"], path)
+        finally:
+            if boot:
+                remount_boot(False)
+    elif kind == "dir":
+        path = op["path"]
+        if os.path.isdir(path) and not os.path.islink(path):
+            if _undo_safe_tree(path):
+                shutil.rmtree(path)
+            else:
+                os.rmdir(path)
+    elif kind == "move":
+        if os.path.lexists(op["dst"]) and not os.path.lexists(op["src"]):
+            shutil.move(op["dst"], op["src"])
+    elif kind == "service_started":
+        script = "/userdata/system/services/" + op["name"]
+        if os.path.exists(P(script)):
+            run([script, "stop"], timeout=20)
+        if op.get("was_enabled"):
+            restart.append(op["name"])
+    elif kind == "mounted":
+        run(["umount", op["path"]], timeout=30)
+    elif kind == "boot_replaced":
+        say("  writing the previous boot partition back from %s ..." % op["backup"])
+        if not restore_boot(op["backup"]):
+            raise RuntimeError("could not restore the boot partition; use: rollback")
+
+
+def cmd_undo_step(args):
+    j = journal_pending()
+    if not j:
+        say("Nothing to undo.")
+        return 0
+    if getattr(args, "discard", False):
+        shutil.rmtree(P(JOURNAL_DIR), ignore_errors=True)
+        say("Kept the changes of '%s'; its undo record was removed." % j.get("label"))
+        return 0
+    ops = j.get("ops", [])
+    head("Putting back what '%s' changed (%d records)" % (j.get("label"), len(ops)))
+    restart, errors = [], []
+    for op in reversed(ops):
+        try:
+            undo_op(op, restart)
+        except Exception as e:  # keep going: everything else should still go back
+            errors.append("%s %s: %s" % (op["op"], UNP(op.get("path") or op.get("dst") or op.get("name") or ""), e))
+    for svc in restart:
+        run(["/userdata/system/services/" + svc, "start"], timeout=20)
+    if errors:
+        say("Could not put back:")
+        for e in errors:
+            say("  ! " + e)
+        say("\nThe undo record is kept; run this again (undo-step) after fixing the cause.")
+        return 1
+    shutil.rmtree(P(JOURNAL_DIR), ignore_errors=True)
+    say("Everything this step changed is back as it was before it started.")
+    return 0
 
 
 # --------------------------------------------------------------------------
@@ -1345,11 +1662,19 @@ def cmd_migrate(args):
     cmd = (["batocera-upgrade", "--media-upgrade", "--file", "/userdata/system/upgrade/boot.tar.xz"]
            if args.manual else ["batocera-upgrade", "--upgrade", "--url", url])
     say(" ".join(cmd))
-    if TEST_MODE():
-        say("(test mode) pretending the upgrade succeeded")
-        rc = 0
-    else:
-        rc = subprocess.call(cmd)
+    if JOURNAL is not None:
+        # a cancel writes the backed-up /boot back; these keep what they are now, not what the backup had
+        JOURNAL.file(P(OVERLAY))
+        JOURNAL.file(P(BOOT_CONF))
+    with critical("Batocera's upgrader installing the new system"):
+        if TEST_MODE():
+            say("(test mode) pretending the upgrade succeeded")
+            rc = 0
+        else:
+            rc = subprocess.call(cmd)
+        if rc == 0:
+            journal_note({"op": "boot_replaced", "backup": bdir})
+        _test_pause("upgrader")
     if rc != 0:
         say("batocera-upgrade failed (rc=%d). Your x86_64 system is unchanged; nothing else was touched." % rc)
         return 1
@@ -1382,20 +1707,23 @@ def park_for_v3(a, st, bdir, park, phase):
             actions["overlay_moved_to"] = UNP(bdir) + "/boot.tar (boot/overlay)"
             say("overlay already removed by the upgrade (original kept in boot.tar)")
         else:
-            remount_boot(True)
-            try:
-                shutil.copy2(P(OVERLAY), target)
-                if sha256_file(target) != a["boot"]["overlay"]["sha256"]:
-                    raise OSError("copy of overlay does not match")
-                os.remove(P(OVERLAY))
-                actions["overlay_moved_to"] = UNP(target)
-                say("overlay -> %s" % UNP(target))
-            except OSError as e:
-                actions["warnings"].append("could not move overlay: %s" % e)
-                say("WARNING: could not move the overlay (%s). Remove /boot/boot/overlay before "
-                    "rebooting; the original is in boot.tar." % e)
-            finally:
-                remount_boot(False)
+            with critical("moving the old overlay off the boot partition"):
+                remount_boot(True)
+                try:
+                    shutil.copy2(P(OVERLAY), target)
+                    if sha256_file(target) != a["boot"]["overlay"]["sha256"]:
+                        raise OSError("copy of overlay does not match")
+                    os.remove(P(OVERLAY))
+                    _test_pause("overlay-moved")
+                    actions["overlay_moved_to"] = UNP(target)
+                    say("overlay -> %s" % UNP(target))
+                except OSError as e:
+                    actions["warnings"].append("could not move overlay: %s" % e)
+                    say("WARNING: could not move the overlay (%s). Remove /boot/boot/overlay before "
+                        "rebooting; the original is in boot.tar." % e)
+                finally:
+                    remount_boot(False)
+    _test_pause("park-services")
     for svc in park:
         try:
             service_toggle(svc, False)
@@ -1457,12 +1785,13 @@ def cmd_unprepare(args):
     ma = st.get("migrate_actions") or {}
     moved = ma.get("overlay_moved_to") or ""
     if moved.endswith("overlay.x86_64") and os.path.exists(P(moved)):
-        remount_boot(True)
-        try:
-            shutil.copy2(P(moved), P(OVERLAY))
-            say("overlay restored")
-        finally:
-            remount_boot(False)
+        with critical("putting the overlay back on the boot partition"):
+            remount_boot(True)
+            try:
+                shutil.copy2(P(moved), P(OVERLAY))
+                say("overlay restored")
+            finally:
+                remount_boot(False)
     for svc in ma.get("parked_services", []):
         service_toggle(svc, True)
         say("re-enabled service %s" % svc)
@@ -1754,9 +2083,11 @@ def fix_xwayland_access(a, tag):
         with open(P(path), "w") as fh:
             fh.write(src)
         os.chmod(P(path), mode)
+    was = ACCESS_SERVICE in conf_parse().get("system.services", "").split()
     service_toggle(ACCESS_SERVICE, True)
     msg = ["installed %s and service %s (enabled)" % (GRANT_PATH, ACCESS_SERVICE)]
     if a["system"]["board"] == V3_BOARD and not TEST_MODE():
+        journal_note({"op": "service_started", "name": ACCESS_SERVICE, "was_enabled": was})
         rc, out = run(["/userdata/system/services/" + ACCESS_SERVICE, "start"], timeout=20)
         msg.append("started (log: /userdata/system/logs/xwayland-access.log)")
     return msg
@@ -2231,9 +2562,11 @@ def fix_launch_watchdog(a, tag):
         with open(P(path), "w") as fh:
             fh.write(src)
         os.chmod(P(path), 0o755)
+    was = watchdog_state()["enabled"]
     service_toggle(WATCHDOG_SERVICE, True)
     out = ["installed %s and service %s (enabled)" % (WATCHDOG_PATH, WATCHDOG_SERVICE)]
     if not TEST_MODE():
+        journal_note({"op": "service_started", "name": WATCHDOG_SERVICE, "was_enabled": was})
         run(["pkill", "-f", "launch_watchdog.py run"])
         run(["/userdata/system/services/" + WATCHDOG_SERVICE, "start"], timeout=20)
         out.append("started. Log: /userdata/system/logs/launch-watchdog.log")
@@ -2526,6 +2859,26 @@ def cmd_integrate(args):
 # --------------------------------------------------------------------------
 # rollback
 # --------------------------------------------------------------------------
+def restore_boot(bdir, verify=True):
+    """Write the boot partition saved in a backup back to /boot. False if the backup can't be used."""
+    boot_tar = os.path.join(P(bdir), "boot.tar")
+    if not os.path.exists(boot_tar) or (verify and not verify_backup_dir(P(bdir))):
+        say("  %s has no usable boot.tar" % bdir)
+        return False
+    with critical("writing the boot partition back"):
+        remount_boot(True)
+        try:
+            with tarfile.open(boot_tar) as t:
+                members = [x for x in t.getmembers() if x.name.startswith("boot")]
+                kw = {"filter": "fully_trusted"} if hasattr(tarfile, "fully_trusted_filter") else {}
+                t.extractall(P("/"), members=members, **kw)
+            if not TEST_MODE():
+                os.sync()
+        finally:
+            remount_boot(False)
+    return True
+
+
 def cmd_rollback(args):
     st = load_json(STATE_DIR + "/state.json", {}) or {}
     bdir = args.backup or st.get("backup_dir")
@@ -2546,15 +2899,7 @@ def cmd_rollback(args):
         say("It also restores /userdata/system/batocera.conf from that backup.")
     if not confirm("ROLLBACK", "Write the old boot partition back?"):
         return 1
-    remount_boot(True)
-    try:
-        with tarfile.open(boot_tar) as t:
-            members = [x for x in t.getmembers() if x.name.startswith("boot")]
-            kw = {"filter": "fully_trusted"} if hasattr(tarfile, "fully_trusted_filter") else {}
-            t.extractall(P("/"), members=members, **kw)
-        os.sync()
-    finally:
-        remount_boot(False)
+    restore_boot(bdir, verify=False)
     say("Boot partition restored.")
     if args.restore_config:
         sys_tar = os.path.join(P(bdir), "system.tar.gz")
@@ -2781,6 +3126,7 @@ def cmd_backup_simple(args):
                 try:
                     tar.add(src, arcname=UNP(src).lstrip("/"), recursive=False)
                     count += 1
+                    _test_pause("backup-file")
                 except OSError as e:
                     errors.append("%s: %s" % (UNP(src), e))
         manifest["archives"][fn] = {"set": name, "roots": roots[:50], "files": count,
@@ -2931,6 +3277,7 @@ def old_overlay_tree(st):
             os.makedirs(mnt, exist_ok=True)
             rc, out = run(["mount", "-o", "loop,ro", P(c), mnt], timeout=30)
             if rc == 0:
+                journal_note({"op": "mounted", "path": mnt})
                 return mnt, (lambda: run(["umount", mnt], timeout=30))
     if bdir and os.path.exists(P(bdir + "/boot.tar")):
         try:
@@ -3006,7 +3353,10 @@ def integrate_overlay(st, tag, done, manual):
                  "\n\nKEPT v3's VERSION (your old one is in the backup):\n" + "\n".join(conflicts) + "\n")
     if added:
         if which("batocera-save-overlay"):
-            rc, out = run(["batocera-save-overlay"], timeout=600)
+            if JOURNAL is not None:
+                JOURNAL.file(P(OVERLAY))
+            with critical("saving the new overlay to the boot partition"):
+                rc, out = run(["batocera-save-overlay"], timeout=600)
             done.append("old overlay: %d files restored and saved to a new v3 overlay%s"
                         % (len(added), "" if rc == 0 else " (save-overlay rc=%d: %s)" % (rc, out[-200:])))
         else:
@@ -3038,6 +3388,7 @@ def cmd_integrate_all(args):
             fn()
         except Exception as e:  # one step failing must not stop the rest
             manual.append("%s step failed: %s" % (name, e))
+        _test_pause("integrate-" + name)
 
     step("hook-backups", lambda: done.extend(fix_hook_backups(a, tag)) if a["hook_backups"] else None)
     step("hook-guard", lambda: done.extend(fix_hook_guard(a, tag)) if hook_guard_state()["direct_hooks"] else None)
@@ -3048,6 +3399,8 @@ def cmd_integrate_all(args):
     step("overlay", lambda: integrate_overlay(st, tag, done, manual))
     write_json(STATE_DIR + "/state.json", st)
     step("watchdog", lambda: done.extend(fix_launch_watchdog(a, tag)) if not watchdog_state()["enabled"] else None)
+    step("launcher", lambda: done.extend(launcher_install(tag))
+         if launcher_state()["installed"] and not launcher_state()["current"] else None)
     # the original checks: display remap, re-enable clean services, plugins, library re-check
     R = do_integrate(True, ack_overlay=bool(st.get("overlay_integrated")))
     done += R["changes"]
@@ -3066,6 +3419,7 @@ def cmd_integrate_all(args):
             if m and any(("service %s " % m.group(1)) in x for x in manual):
                 continue  # already explained (X11 desktop)
             manual.append(i["title"])
+    _test_pause("integrate-checks")
     st = load_json(STATE_DIR + "/state.json", {}) or {}
     st["phase"] = "integrated" if not manual else "integrated-with-notes"
     write_json(STATE_DIR + "/state.json", st)
@@ -3112,12 +3466,1219 @@ def cmd_auto(args):
     return cmd_update(args)
 
 
+# --------------------------------------------------------------------------
+# Ports launcher: "V3 Migration" in ES's Ports list opens a controller-driven menu
+# --------------------------------------------------------------------------
+LAUNCHER_SH = "/userdata/roms/ports/V3 Migration.sh"
+LAUNCHER_KEYS = LAUNCHER_SH + ".keys"
+LAUNCHER_MARK = "# v3-migrate-launcher"
+MENU_LOG = "/userdata/system/logs/v3-migrate-menu.log"
+MENU_LAST = STATE_DIR + "/menu-last-run.log"
+MENU_RUN = STATE_DIR + "/menu-run.json"
+MENU_TITLE = "x86-64-v3 Migration"
+TOOL_PLACES = ["/userdata/system/add-ons/v3-migrate/batocera_v3_migrate.py",
+               "/userdata/system/batocera_v3_migrate.py"]
+
+LAUNCHER_SRC = """#!/bin/bash
+%(mark)s
+# x86-64-v3 Migration menu, opened from ES's Ports list. Written by
+#   batocera_v3_migrate.py launcher install      (remove with: launcher remove)
+# Controller (through the .keys file): D-pad/stick move, OK and back are the same buttons
+# as in ES (they follow "switch confirm & cancel buttons"), Start = OK, Select = back,
+# L1/R1 = page up/down.
+TOOL=%(tool)s
+for t in "$TOOL" %(places)s; do
+    if [ -f "$t" ]; then TOOL="$t"; break; fi
+done
+export DISPLAY="${DISPLAY:-:0.0}"
+LOG=/userdata/system/logs/v3-migrate-menu.log
+mkdir -p /userdata/system/logs
+if [ ! -f "$TOOL" ]; then
+    echo "$(date '+%%F %%T') launcher: migration tool not found" >>"$LOG"
+    curl -s -m 5 --data "x86-64-v3 Migration: the tool is missing. Reinstall it from BUA." \\
+        http://127.0.0.1:1234/messagebox >/dev/null 2>&1
+    exit 1
+fi
+# the full-screen menu (pygame, like the BUA app); exit code 3 = it can't start here
+python3 -B "$TOOL" gui 2>>"$LOG"
+[ $? -ne 3 ] && exit 0
+if command -v xterm >/dev/null 2>&1; then
+    xterm -fs 20 -maximized -fg white -bg black -fa DejaVuSansMono -en UTF-8 \\
+        -T "x86-64-v3 Migration" -e python3 -B "$TOOL" menu 2>>"$LOG"
+    exit 0
+fi
+echo "$(date '+%%F %%T') launcher: xterm not found" >>"$LOG"
+curl -s -m 5 --data "x86-64-v3 Migration needs xterm, which this system lacks. Over SSH run: python3 $TOOL" \\
+    http://127.0.0.1:1234/messagebox >/dev/null 2>&1
+exit 1
+"""
+
+ES_SETTINGS = "/userdata/system/configs/emulationstation/es_settings.cfg"
+
+
+def es_ok_button():
+    """The pad button ES uses for OK: "b" (south), or "a" (east) when "switch confirm & cancel
+    buttons" (InvertButtons) is on - exactly as Batocera's EmulationStation decides it."""
+    m = re.search(r'<bool\s+name="InvertButtons"\s+value="(\w+)"', read(ES_SETTINGS))
+    return "a" if m and m.group(1).lower() == "true" else "b"
+
+
+ES_INPUT = "/userdata/system/configs/emulationstation/es_input.cfg"
+EV_POSITIONS = {"304": "south", "305": "east", "307": "north", "308": "west"}   # BTN_SOUTH/EAST/NORTH/WEST
+
+
+def es_button_positions(pad_names):
+    """Where ES's "a" and "b" sit on the connected pad ({"a": "east", ...}), from its es_input.cfg
+    entry (the evdev code recorded when the pad was configured). Empty if unknown."""
+    import xml.etree.ElementTree as ET
+    try:
+        root = ET.fromstring(read(ES_INPUT) or "<x/>")
+    except ET.ParseError:
+        return {}
+    for cfg in root.iter("inputConfig"):
+        if cfg.get("type") == "joystick" and cfg.get("deviceName") in pad_names:
+            out = {}
+            for inp in cfg.iter("input"):
+                if inp.get("name") in ("a", "b") and inp.get("code") in EV_POSITIONS:
+                    out[inp.get("name")] = EV_POSITIONS[inp.get("code")]
+            return out
+    return {}
+
+
+def launcher_keys(ok=None):
+    """The Ports .keys map: ES's OK button -> Enter, its back button -> Esc, like ES itself."""
+    ok = ok or es_ok_button()
+    back = "a" if ok == "b" else "b"
+    return {"actions_player1": [
+        {"trigger": "up", "type": "key", "target": "KEY_UP"},
+        {"trigger": "down", "type": "key", "target": "KEY_DOWN"},
+        {"trigger": "left", "type": "key", "target": "KEY_LEFT"},
+        {"trigger": "right", "type": "key", "target": "KEY_RIGHT"},
+        {"trigger": "joystick1up", "type": "key", "target": "KEY_UP"},
+        {"trigger": "joystick1down", "type": "key", "target": "KEY_DOWN"},
+        {"trigger": "joystick1left", "type": "key", "target": "KEY_LEFT"},
+        {"trigger": "joystick1right", "type": "key", "target": "KEY_RIGHT"},
+        {"trigger": ok, "type": "key", "target": "KEY_ENTER"},
+        {"trigger": "start", "type": "key", "target": "KEY_ENTER"},
+        {"trigger": back, "type": "key", "target": "KEY_ESC"},
+        {"trigger": "select", "type": "key", "target": "KEY_ESC"},
+        {"trigger": "x", "type": "key", "target": "KEY_TAB"},
+        {"trigger": "pageup", "type": "key", "target": "KEY_PAGEUP"},
+        {"trigger": "pagedown", "type": "key", "target": "KEY_PAGEDOWN"},
+    ]}
+
+
+def launcher_keys_text(ok=None):
+    return json.dumps(launcher_keys(ok), indent=4) + "\n"
+
+
+def keys_ok_button():
+    """Which pad button the installed .keys file turns into Enter ("a"/"b"), or None."""
+    try:
+        acts = json.loads(read(LAUNCHER_KEYS) or "{}").get("actions_player1", [])
+    except ValueError:
+        return None
+    return next((x.get("trigger") for x in acts if x.get("target") == "KEY_ENTER"
+                 and x.get("trigger") in ("a", "b")), None)
+
+
+def keys_out_of_date():
+    """True when ES's OK/back buttons were switched since the .keys file was written. evmapy reads
+    that file when the port starts, so the fix (rewriting it) applies from the next start."""
+    loaded = keys_ok_button()
+    if not loaded or loaded == es_ok_button():
+        return False
+    try:
+        launcher_install()
+    except (OSError, RuntimeError):
+        pass
+    return True
+
+
+def tool_path():
+    return UNP(os.path.abspath(__file__))
+
+
+def launcher_text(tool=None):
+    import shlex
+    tool = tool or tool_path()
+    return LAUNCHER_SRC % {"mark": LAUNCHER_MARK, "tool": shlex.quote(tool),
+                           "places": " ".join(shlex.quote(p) for p in TOOL_PLACES if p != tool)}
+
+
+def launcher_state():
+    sh = read(LAUNCHER_SH)
+    return {"installed": LAUNCHER_MARK in sh, "present": os.path.lexists(P(LAUNCHER_SH)),
+            "current": sh == launcher_text() and read(LAUNCHER_KEYS) == launcher_keys_text()}
+
+
+def es_reload_games():
+    if TEST_MODE():
+        return
+    try:
+        urllib.request.urlopen("http://127.0.0.1:1234/reloadgames", timeout=5).read()
+    except Exception:
+        pass  # ES not running (or no web API): the entry shows after the next ES start
+
+
+def launcher_install(tag=None):
+    st = launcher_state()
+    if st["present"] and not st["installed"]:
+        raise RuntimeError("%s exists and was not written by this tool; not touching it" % LAUNCHER_SH)
+    tag = tag or stamp()
+    out = []
+    keys = launcher_keys_text()
+    for path, text, mode in ((LAUNCHER_SH, launcher_text(), 0o755), (LAUNCHER_KEYS, keys, 0o644)):
+        if read(path) == text:
+            continue
+        if os.path.exists(P(path)):
+            fix_backup(path, tag)
+        os.makedirs(os.path.dirname(P(path)), exist_ok=True)
+        tmp = P(path) + ".v3m.tmp"
+        with open(tmp, "w") as fh:
+            fh.write(text)
+        os.chmod(tmp, mode)
+        os.replace(tmp, P(path))
+        out.append("wrote %s" % path)
+    if not bash_ok(P(LAUNCHER_SH)):
+        raise RuntimeError("the launcher failed bash -n; see %s" % LAUNCHER_SH)
+    if out:
+        es_reload_games()
+        out.append("'V3 Migration' is in Ports (runs %s)" % tool_path())
+    return out
+
+
+def launcher_remove():
+    if not launcher_state()["installed"]:
+        return []
+    out = []
+    for path in (LAUNCHER_SH, LAUNCHER_KEYS):
+        if os.path.lexists(P(path)):
+            os.remove(P(path))
+            out.append("removed %s" % path)
+    es_reload_games()
+    return out
+
+
+def cmd_launcher(args):
+    try:
+        if args.action == "install":
+            out = launcher_install() or ["already up to date: %s" % LAUNCHER_SH]
+        elif args.action == "remove":
+            out = launcher_remove() or ["not installed"]
+        else:
+            s = launcher_state()
+            out = ["%s: %s" % (LAUNCHER_SH, "installed" + ("" if s["current"] else " (older version; "
+                                                                "run: launcher install)") if s["installed"]
+                               else "present, not ours" if s["present"] else "not installed")]
+    except (OSError, RuntimeError) as e:
+        say("Launcher: %s" % e)
+        return 1
+    for line in out:
+        say("  " + line)
+    return 0
+
+
+# ---- the menu itself (runs in xterm; dialog if present, plain text otherwise)
+class DialogUI:
+    def __init__(self, exe):
+        self.exe = exe
+
+    def _run(self, args):
+        env = dict(os.environ, DIALOGRC=os.environ.get("DIALOGRC", "/userdata/system/add-ons/.dialogrc"))
+        r = subprocess.run([self.exe, "--backtitle", "%s  (tool v%s)" % (MENU_TITLE, VERSION)] + args,
+                           stderr=subprocess.PIPE, env=env)
+        return r.returncode, r.stderr.decode(errors="replace").strip()
+
+    def menu(self, text, items, default=None, cancel="Back"):
+        args = ["--title", MENU_TITLE, "--no-tags", "--ok-label", "Select", "--cancel-label", cancel]
+        if default:
+            args += ["--default-item", default]
+        flat = [x for k, label in items for x in (k, label)]
+        rc, out = self._run(args + ["--menu", text, "0", "0", str(min(len(items), 12))] + flat)
+        return out if rc == 0 else None
+
+    def yesno(self, text):
+        return self._run(["--title", MENU_TITLE, "--yesno", text, "0", "0"])[0] == 0
+
+    def msgbox(self, text):
+        self._run(["--title", MENU_TITLE, "--msgbox", text, "0", "0"])
+
+    def textbox(self, path, title):
+        self._run(["--title", title, "--exit-label", "Back", "--textbox", path, "-1", "-1"])
+
+    def clear(self):
+        sys.stdout.write("\033[2J\033[H")
+        sys.stdout.flush()
+
+
+class PlainUI:
+    """No dialog: numbered menus for a keyboard (or SSH)."""
+
+    def _ask(self, prompt):
+        try:
+            return input(prompt).strip()
+        except EOFError:
+            return ""
+
+    def menu(self, text, items, default=None, cancel="Back"):
+        say("\n" + text)
+        for n, (k, label) in enumerate(items, 1):
+            say("  %d) %s%s" % (n, label, "   <- next" if k == default else ""))
+        ans = self._ask("Number (Enter = %s): " % cancel.lower())
+        return items[int(ans) - 1][0] if ans.isdigit() and 0 < int(ans) <= len(items) else None
+
+    def yesno(self, text):
+        return self._ask("\n%s\n[y/N] " % text).lower() in ("y", "yes")
+
+    def msgbox(self, text):
+        self._ask("\n%s\n(Enter) " % text)
+
+    def textbox(self, path, title):
+        say("\n== %s ==" % title)
+        say(read(path))
+        self._ask("(Enter) ")
+
+    def clear(self):
+        pass
+
+
+def menu_ui():
+    exe = os.environ.get("V3M_DIALOG") or shutil.which("dialog")
+    return DialogUI(exe) if exe else PlainUI()
+
+
+def pid_alive(pid, marker=None):
+    try:
+        os.kill(int(pid), 0)
+        if marker:
+            with open("/proc/%d/cmdline" % int(pid), "rb") as fh:
+                return marker.encode() in fh.read()
+        return True
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+def backup_targets():
+    """(path, label) for every mounted drive under /media, plus the internal default."""
+    out, mounts = [], {}
+    for line in read("/proc/mounts").splitlines():
+        f = line.split()
+        if len(f) >= 3:
+            mounts[f[1].replace("\\040", " ")] = f[2]
+    media = P("/media")
+    for n in sorted(os.listdir(media)) if os.path.isdir(media) else []:
+        path = "/media/" + n
+        if path not in mounts and not TEST_MODE():
+            continue
+        try:
+            du = shutil.disk_usage(P(path))
+        except OSError:
+            continue
+        out.append((path, "%s free of %s  (%s)" % (human(du.free), human(du.total), mounts.get(path, "?"))))
+    internal = STATE_DIR + "/backups"
+    try:
+        free = human(shutil.disk_usage(P("/userdata")).free)
+    except OSError:
+        free = "?"
+    out.append((internal, "internal /userdata (%s free) - no protection if this disk fails" % free))
+    return out
+
+
+def menu_steps(st, board):
+    """[(key, label, argv, confirm text)] for this board and phase; plus the suggested next key."""
+    phase = st.get("phase") or "start"
+    if board == V3_BOARD:
+        again = phase.startswith("integrated")
+        steps = [("integrate", "Integrate%s" % (" again (safe to repeat)" if again else
+                                                 "  - finish the move to x86-64-v3"), ["integrate"],
+                  "Integrate everything the update affected into x86-64-v3: hooks, Xwayland access, "
+                  "services, overlay files, display output, launch watchdog and rescue combo.\n\n"
+                  "Every file it changes is backed up first. Run it?")]
+        nxt = "integrate"
+    elif board == V1_BOARD:
+        scanned = bool(load_json(SCAN_FILE)) and phase != "start"
+        backed = bool(st.get("backup_verified"))
+        steps = [("scan", "Scan%s  - find what the update affects (read-only)" % (" again" if scanned else ""),
+                  ["scan"], "Scan the system for everything the x86-64-v3 update affects?\n\n"
+                  "Read-only. It takes a few minutes."),
+                 ("backup", "Back up  - those files + the boot partition (for rollback)", None, None)]
+        if phase == "prepared":
+            steps += [("update-now", "Update now  - download and install x86-64-v3 from here", ["update", "--now"],
+                       "Download and install the x86-64-v3 image now with Batocera's upgrader?\n\n"
+                       "When it finishes, reboot, then open V3 Migration again to integrate."),
+                      ("unprepare", "Undo prepare  - put the overlay and services back", ["unprepare"],
+                       "Undo prepare: put the parked overlay and services back as they were?")]
+        else:
+            steps += [("prepare", "Prepare for the update  - then use Updates & Downloads", ["update"],
+                       "Prepare for the update: move the x86_64 overlay into the backup and park the "
+                       "X11-only services (both take effect at the next boot).\n\n"
+                       "Afterwards start the x86-64-v3 upgrade from Updates & Downloads. Run it?")]
+        nxt = "scan" if not scanned else "backup" if not backed else \
+            "update-now" if phase == "prepared" else "prepare"
+    else:
+        steps, nxt = [], None
+    steps += [("status", "Status  - where the migration is", ["status"], None),
+              ("log", "Last result  - the output of the last step", None, None)]
+    return steps, nxt
+
+
+def step_start(argv, label, append=False):
+    """Start one step of this tool in its own session, so closing the window (or the exit
+    hotkey) can't cut it off, with a journal so it can be cancelled and undone.
+    Output goes to MENU_LAST. Returns the Popen."""
+    os.makedirs(os.path.dirname(P(MENU_LAST)), exist_ok=True)
+    os.makedirs(os.path.dirname(P(MENU_LOG)), exist_ok=True)
+    cmd = [sys.executable, "-u", "-B", os.path.abspath(__file__), "--yes"]
+    if TEST_MODE():
+        cmd += ["--root", ROOT]
+    if argv[0] != "undo-step":
+        cmd += ["--journal"]
+    cmd += argv
+    with open(P(MENU_LAST), "a" if append else "w") as fh:
+        fh.write("%s  %s: %s\n\n" % (now(), label, " ".join(argv)))
+        fh.flush()
+        proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=fh, stderr=subprocess.STDOUT,
+                                start_new_session=True, close_fds=True)
+    write_json(MENU_RUN, {"pid": proc.pid, "label": label, "argv": argv, "start": now(),
+                          "marker": os.path.basename(__file__)})
+    return proc
+
+
+def step_finish(rc):
+    try:
+        os.remove(P(MENU_RUN))
+    except OSError:
+        pass
+    with open(P(MENU_LAST), "a") as fh:
+        fh.write("\n%s  exit code %s\n" % (now(), rc))
+    with open(P(MENU_LOG), "a") as fh:
+        fh.write(read(MENU_LAST) + "\n")
+
+
+class StepCancel:
+    """Cancel for a running step: ask it to stop (it finishes any part that writes /boot first),
+    force it if it ignores that, then put back what it changed (undo-step).
+    tick() drives it; state is running / stopping / undoing / done."""
+    FORCE_AFTER = 20.0
+
+    def __init__(self, pid, poll):
+        import time
+        self.time = time
+        self.pid, self.poll = pid, poll
+        self.state, self.rc, self.undo_rc, self.undo = "running", None, None, None
+        self.asked = None
+
+    def request(self):
+        if self.state != "running":
+            return
+        self.state, self.asked = "stopping", self.time.time()
+        try:
+            os.kill(self.pid, signal.SIGTERM)
+        except OSError:
+            pass
+
+    def waiting_for(self):
+        return journal_critical() if self.state == "stopping" else ""
+
+    def tick(self):
+        if self.state in ("running", "stopping"):
+            rc = self.poll()
+            if rc is None:
+                if self.state == "stopping" and not journal_critical() and \
+                        self.time.time() - self.asked > self.FORCE_AFTER:
+                    try:
+                        os.killpg(self.pid, signal.SIGKILL)   # it ignored the request: stop it and its helpers
+                    except OSError:
+                        pass
+                return None
+            self.rc = rc
+            if self.state == "stopping" and journal_pending():
+                with open(P(MENU_LAST), "a") as fh:
+                    fh.write("\n%s  stopped (code %s)\n\n" % (now(), rc))
+                self.undo = step_start(["undo-step"], "Cancel: putting things back", append=True)
+                self.state = "undoing"
+                return None
+            self.state = "done"
+            return rc
+        if self.state == "undoing":
+            rc = self.undo.poll()
+            if rc is None:
+                return None
+            self.undo_rc, self.state = rc, "done"
+            return self.rc
+        return self.rc
+
+    @property
+    def cancelled(self):
+        return self.undo is not None
+
+
+def step_running():
+    """The MENU_RUN record of a step that is still running (started by an earlier menu), or None."""
+    info = load_json(MENU_RUN)
+    if info and pid_alive(info.get("pid"), info.get("marker")):
+        return info
+    if info:
+        try:
+            os.remove(P(MENU_RUN))
+        except OSError:
+            pass
+    return None
+
+
+def menu_run(ui, argv, label):
+    """Run one step, showing its output live (Esc = cancel and put back); then show the result."""
+    ui.clear()
+    say("== %s ==  (Esc = cancel; the step finishes even if this window closes)\n" % label)
+    proc = step_start(argv, label)
+    ctl = StepCancel(proc.pid, proc.poll)
+
+    def on_key(ch):
+        if ch == "\x1b" and ctl.state == "running" and ui.yesno(
+                "Cancel %s?\n\nIt stops and puts back everything this step changed, so your system is as "
+                "it was before you started it." % label):
+            ctl.request()
+            ui.clear()
+            say("== Cancelling %s: stopping, then putting back what it changed ==\n" % label)
+    rc = menu_follow(ctl.tick, on_key=on_key if argv[0] != "undo-step" else None)
+    step_finish(rc)
+    if ctl.cancelled:
+        title = "%s: cancelled, %s" % (label, "all put back" if ctl.undo_rc == 0 else "undo incomplete")
+    else:
+        title = "%s: %s" % (label, "done" if rc == 0 else "stopped (code %s)" % rc)
+    ui.textbox(P(MENU_LAST), title)
+    return rc
+
+
+def menu_follow(poll, interval=0.3, on_key=None):
+    """Copy MENU_LAST to the terminal as it grows until poll() returns a code (not None).
+    on_key(ch) gets keys typed meanwhile (terminal only)."""
+    tty = None
+    if on_key and sys.stdin.isatty():
+        import termios
+        import tty as _tty
+        tty = termios.tcgetattr(sys.stdin)
+        _tty.setcbreak(sys.stdin)
+    try:
+        return _menu_follow(poll, interval, on_key if tty else None)
+    finally:
+        if tty:
+            import termios
+            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, tty)
+
+
+def _menu_follow(poll, interval, on_key):
+    import select
+    import time
+    pos, rc = 0, None
+    while True:
+        rc = poll()
+        try:
+            with open(P(MENU_LAST), "rb") as fh:
+                fh.seek(pos)
+                chunk = fh.read()
+            pos += len(chunk)
+            if chunk:
+                sys.stdout.write(chunk.decode(errors="replace"))
+                sys.stdout.flush()
+        except OSError:
+            pass
+        if rc is not None:
+            return rc
+        if on_key:
+            if select.select([sys.stdin], [], [], interval)[0]:
+                ch = os.read(sys.stdin.fileno(), 1).decode(errors="replace")
+                on_key(ch)
+        else:
+            time.sleep(interval)
+
+
+def cmd_menu(args):
+    ui = menu_ui()
+    if keys_out_of_date():
+        ui.msgbox("ES's confirm and back buttons were switched since this menu was last opened, so the "
+                  "buttons here don't match ES yet.\n\nThat is fixed now: close this and open "
+                  "V3 Migration again.")
+        return 0
+    run_info = step_running()
+    if run_info:
+        ui.clear()
+        say("== %s is still running (started %s) ==\n" % (run_info.get("label"), run_info.get("start")))
+        pid, marker = run_info["pid"], run_info.get("marker")
+        menu_follow(lambda: None if pid_alive(pid, marker) else 0, interval=1)
+        try:
+            os.remove(P(MENU_RUN))
+        except OSError:
+            pass
+        ui.textbox(P(MENU_LAST), "%s: finished" % run_info.get("label"))
+    j = journal_pending()
+    if j and not step_running():
+        if ui.yesno("The last step ('%s') didn't finish (cancelled, a power cut, or a crash).\n\n"
+                    "Put back what it changed?" % j.get("label")):
+            menu_run(ui, ["undo-step"], "Putting things back")
+        elif ui.yesno("Keep its changes instead? This can't be undone afterwards."):
+            menu_run(ui, ["undo-step", "--discard"], "Keeping the changes")
+    while True:
+        st = load_json(STATE_DIR + "/state.json", {}) or {}
+        board = read(BOARD_FILE).strip()
+        steps, nxt = menu_steps(st, board)
+        if board not in (V1_BOARD, V3_BOARD):
+            ui.msgbox("This is for Batocera on PCs (x86_64 or x86-64-v3).\n\nThis system: %s" % (board or "unknown"))
+            return 2
+        head_text = "Board: %s    Step: %s\nNext: %s" % (
+            board, st.get("phase") or "start", next((l.split("  -")[0] for k, l, _, _ in steps if k == nxt), "-"))
+        choice = ui.menu(head_text, [(k, l) for k, l, _, _ in steps], default=nxt, cancel="Exit")
+        if choice is None:
+            return 0
+        key, label, argv, question = next(s for s in steps if s[0] == choice)
+        if key == "log":
+            if os.path.exists(P(MENU_LAST)):
+                ui.textbox(P(MENU_LAST), "Last result")
+            else:
+                ui.msgbox("Nothing has run from this menu yet.")
+            continue
+        if key == "backup":
+            targets = backup_targets()
+            dest = ui.menu("Where should the backup go? An external drive is safest.\n"
+                           "Needed: the files the scan found plus the boot partition (about 5 GB).",
+                           targets, default=targets[0][0])
+            if dest is None:
+                continue
+            argv = ["backup"] + (["--dest", dest] if dest != STATE_DIR + "/backups" else [])
+            question = "Back up to %s?\n\nThis can take a while on a slow drive." % dest
+        if question and not ui.yesno(question):
+            continue
+        rc = menu_run(ui, argv, label.split("  -")[0])
+        if key == "update-now" and rc == 0 and ui.yesno("The x86-64-v3 image is installed.\n\nReboot now?"):
+            if not TEST_MODE():
+                subprocess.run(["sync"])
+                subprocess.run(["reboot"])
+            return 0
+
+
+# ---- the full-screen menu (pygame, styled after the BUA app); the dialog menu is the fallback
+GUI_UNAVAILABLE = 3          # exit code the launcher reads as "use the terminal menu instead"
+GUI_BG = (10, 13, 18)
+GUI_CARD = (27, 35, 45)
+GUI_CARD_HI = (36, 48, 62)
+GUI_ACCENT = (58, 166, 255)
+GUI_FG = (236, 242, 248)
+GUI_MUTED = (139, 152, 166)
+GUI_SUCCESS = (76, 205, 140)
+GUI_DANGER = (232, 96, 96)
+GUI_FOOTER = (6, 8, 12)
+GUI_TILE_COLORS = {"scan": (64, 116, 214), "backup": (136, 92, 214), "prepare": (214, 118, 62),
+                   "update-now": (40, 156, 136), "unprepare": (190, 150, 36), "integrate": (40, 156, 136),
+                   "status": (52, 138, 186), "log": (92, 148, 58), "drive": (64, 116, 214)}
+GUI_TILE_TEXT = {"scan": "1", "backup": "2", "prepare": "3", "update-now": "4", "unprepare": "↺",
+                 "integrate": "4", "status": "i", "log": "≡", "drive": "▤"}
+# What each controller family prints on its south and east buttons. ES's OK is the south button
+# (its "b"), or the east one ("a") when ES's confirm/cancel buttons are switched; the launcher's
+# .keys file turns OK into Enter and back into Esc to match.
+GUI_PADS = {"nintendo": {"south": "B", "east": "A", "pgup": "L", "pgdn": "R"},
+            "xbox": {"south": "A", "east": "B", "pgup": "LB", "pgdn": "RB"},
+            "playstation": {"south": "\u2715", "east": "\u25cb", "pgup": "L1", "pgdn": "R1"},
+            "keyboard": {"south": "Enter", "east": "Esc", "pgup": "PgUp", "pgdn": "PgDn"}}
+NO_CONFIRM_DEFAULT = ("update-now", "unprepare")   # these dialogs start on "No"
+CANCEL_NOTES = {
+    "update-now": "If Batocera's upgrader has already started, it finishes first; then your previous boot "
+                  "partition is written back from the backup.",
+    "integrate": "If the new overlay was already saved, the previous one is put back on the boot partition.",
+    "prepare": "If the overlay is being moved, that finishes first; then it is put back.",
+    "backup": "The unfinished backup is deleted.",
+}
+
+
+class MigrateGui:
+    def __init__(self, pg, windowed=False, script=None, shots=None):
+        self.pg = pg
+        os.environ.setdefault("SDL_VIDEO_WINDOW_POS", "0,0")
+        if windowed:
+            self.screen = pg.display.set_mode((1280, 720))
+        else:
+            info = pg.display.Info()
+            self.screen = pg.display.set_mode((info.current_w, info.current_h), pg.NOFRAME)
+        pg.display.set_caption(MENU_TITLE)
+        pg.mouse.set_visible(False)
+        pg.key.set_repeat(350, 70)
+        self.W, self.H = self.screen.get_size()
+        self.k = max(1.0, min(self.W / 1280.0, self.H / 720.0))
+        f = lambda size, bold=False, mono=False: pg.font.SysFont(
+            "DejaVu Sans Mono" if mono else "DejaVu Sans", self.s(size), bold=bold)
+        self.f = {"hero": f(30, True), "tile": f(20, True), "body": f(17), "small": f(14),
+                  "mono": f(15, mono=True), "glyph": f(26, True), "key": f(14, True)}
+        self.bg = self._background()
+        self.clock = pg.time.Clock()
+        self.pad_names = []
+        self.pad = os.environ.get("V3M_PAD") if os.environ.get("V3M_PAD") in GUI_PADS else self._pad_style()
+        self.ok_btn = es_ok_button()
+        self.es_pos = es_button_positions(self.pad_names)
+        self.script = list(script or [])
+        self.shots, self.shot_n, self.next_inject = shots, 0, 0
+
+    def s(self, n):
+        return int(round(n * self.k))
+
+    # ---------- drawing helpers (same look as the BUA app)
+    def _background(self):
+        pg = self.pg
+        surf = pg.Surface((self.W, self.H)).convert()
+        top = (16, 22, 32)
+        for i in range(self.H):
+            t = i / max(1, self.H - 1)
+            pg.draw.line(surf, tuple(int(top[c] + (GUI_BG[c] - top[c]) * t) for c in range(3)), (0, i), (self.W, i))
+        glow = pg.Surface((64, 36), pg.SRCALPHA)
+        for r in range(28, 0, -1):
+            pg.draw.circle(glow, (*GUI_ACCENT, int(5 * (28 - r) / 28) + 1), (8, 4), r)
+        surf.blit(pg.transform.smoothscale(glow, (self.W, self.H)), (0, 0))
+        return surf
+
+    def _pad_style(self):
+        pg = self.pg
+        try:
+            pg.joystick.init()
+            self.pad_names = [pg.joystick.Joystick(i).get_name() or "" for i in range(pg.joystick.get_count())]
+        except Exception:
+            self.pad_names = []
+        names = " ".join(n.lower() for n in self.pad_names)
+        if not names.strip():
+            return "keyboard"
+        if any(x in names for x in ("sony", "playstation", "dualsense", "dualshock")):
+            return "playstation"
+        if any(x in names for x in ("nintendo", "pro controller", "switch", "joy-con")):
+            return "nintendo"
+        return "xbox"
+
+    def text(self, txt, font, color, pos):
+        img = self.f[font].render(txt, True, color)
+        self.screen.blit(img, pos)
+        return img.get_width()
+
+    def fit(self, txt, font, width):
+        fnt = self.f[font]
+        if fnt.size(txt)[0] <= width:
+            return txt
+        while txt and fnt.size(txt + "...")[0] > width:
+            txt = txt[:-1]
+        return txt.rstrip() + "..."
+
+    def wrap(self, txt, font, width):
+        out = []
+        for para in txt.split("\n"):
+            line = ""
+            for word in para.split(" "):
+                trial = (line + " " + word).strip()
+                if self.f[font].size(trial)[0] <= width or not line:
+                    line = trial
+                else:
+                    out.append(line)
+                    line = word
+            out.append(line)
+        return out
+
+    def tile(self, rect, selected=False, radius=None, fill=None, accent=None):
+        pg = self.pg
+        radius = self.s(14) if radius is None else radius
+        shadow = pg.Surface(rect.size, pg.SRCALPHA)
+        pg.draw.rect(shadow, (0, 0, 0, 110), shadow.get_rect(), border_radius=radius)
+        self.screen.blit(shadow, rect.move(0, self.s(5)))
+        pg.draw.rect(self.screen, fill or (GUI_CARD_HI if selected else GUI_CARD), rect, border_radius=radius)
+        if selected:
+            pg.draw.rect(self.screen, accent or GUI_ACCENT, rect, width=max(2, self.s(3)), border_radius=radius)
+
+    def chip(self, txt, color, right_top=None, left_mid=None):
+        img = self.f["body"].render(txt, True, GUI_FG)
+        r = self.pg.Rect(0, 0, img.get_width() + self.s(28), img.get_height() + self.s(12))
+        if right_top:
+            r.topright = right_top
+        else:
+            r.midleft = left_mid
+        self.pg.draw.rect(self.screen, color, r, border_radius=r.h // 2)
+        self.screen.blit(img, img.get_rect(center=r.center))
+        return r
+
+    def header(self, title, subtitle=""):
+        m, y = self.s(48), self.s(28)
+        self.text(self.fit(title, "hero", self.W - 2 * m - self.s(260)), "hero", GUI_FG, (m, y))
+        y += self.f["hero"].get_height() + self.s(4)
+        if subtitle:
+            self.text(self.fit(subtitle, "body", self.W - 2 * m), "body", GUI_MUTED, (m, y))
+            y += self.f["body"].get_height()
+        return y + self.s(24)
+
+    def button_glyph(self, x, y, name):
+        """A round controller button (or a keycap) with its label; returns the width."""
+        pg, fnt = self.pg, self.f["key"]
+        img = fnt.render(name, True, GUI_FG)
+        h = self.f["body"].get_height() + self.s(6)
+        w = max(h, img.get_width() + self.s(14))
+        r = pg.Rect(x, y - self.s(3), w, h)
+        pg.draw.rect(self.screen, (48, 62, 80), r, border_radius=h // 2 if len(name) <= 2 else self.s(6))
+        pg.draw.rect(self.screen, (98, 116, 138), r, width=max(1, self.s(2)),
+                     border_radius=h // 2 if len(name) <= 2 else self.s(6))
+        self.screen.blit(img, img.get_rect(center=r.center))
+        return w
+
+    def button_names(self):
+        """Printed names of ES's OK and back buttons on the connected pad, from the positions ES's
+        own controller config gives them (es_input.cfg), plus page up/down."""
+        names = dict(GUI_PADS[self.pad])
+        if self.pad == "keyboard":
+            names.update(ok="Enter", back="Esc")
+            return names
+        back_btn = "a" if self.ok_btn == "b" else "b"
+        default = {"b": "south", "a": "east"}
+        pos = {k: self.es_pos.get(k, default[k]) for k in ("a", "b")}
+        names.update(ok=names.get(pos[self.ok_btn], "OK"), back=names.get(pos[back_btn], "Back"))
+        return names
+
+    def footer(self, hints, status=""):
+        """hints: [(button key in GUI_PADS, label)]"""
+        pg = self.pg
+        h = self.s(54)
+        pg.draw.rect(self.screen, GUI_FOOTER, (0, self.H - h, self.W, h))
+        pg.draw.line(self.screen, (34, 45, 58), (0, self.H - h), (self.W, self.H - h), 1)
+        y = self.H - h + (h - self.f["body"].get_height()) // 2
+        names = self.button_names()
+        parts = []
+        for key, label in hints:
+            parts.append((names.get(key, key), label))
+        widths = [self.f["body"].size(lbl)[0] + max(self.f["body"].get_height() + self.s(6),
+                                                     self.f["key"].size(n)[0] + self.s(14)) + self.s(10)
+                  for n, lbl in parts]
+        x = self.W - self.s(48) - sum(widths) - self.s(36) * max(0, len(parts) - 1)
+        if status:
+            self.text(self.fit(status, "body", max(0, x - self.s(96))), "body", GUI_MUTED, (self.s(48), y))
+        for (n, lbl), w in zip(parts, widths):
+            gw = self.button_glyph(x, y, n)
+            self.text(lbl, "body", GUI_FG, (x + gw + self.s(10), y))
+            x += w + self.s(36)
+
+    def row(self, rect, selected, key, title, subtitle="", badge=None):
+        pg = self.pg
+        self.tile(rect, selected, radius=self.s(12))
+        mono = rect.h - self.s(16)
+        mrect = pg.Rect(rect.x + self.s(8), rect.y + self.s(8), int(mono * 1.25), mono)
+        pg.draw.rect(self.screen, GUI_TILE_COLORS.get(key, (64, 116, 214)), mrect, border_radius=self.s(10))
+        g = self.f["glyph"].render(GUI_TILE_TEXT.get(key, "?"), True, GUI_FG)
+        self.screen.blit(g, g.get_rect(center=mrect.center))
+        x = mrect.right + self.s(18)
+        right = rect.right - self.s(18)
+        if badge:
+            img = self.f["small"].render(badge[0], True, GUI_FG)
+            b = pg.Rect(0, 0, img.get_width() + self.s(20), img.get_height() + self.s(8))
+            b.midright = (right, rect.centery)
+            pg.draw.rect(self.screen, badge[1], b, border_radius=b.h // 2)
+            self.screen.blit(img, img.get_rect(center=b.center))
+            right = b.x - self.s(14)
+        w = right - x
+        if subtitle:
+            y = rect.centery - (self.f["tile"].get_height() + self.f["small"].get_height() + self.s(2)) // 2
+            self.text(self.fit(title, "tile", w), "tile", GUI_FG, (x, y))
+            self.text(self.fit(subtitle, "small", w), "small", GUI_MUTED,
+                      (x, y + self.f["tile"].get_height() + self.s(2)))
+        else:
+            self.text(self.fit(title, "tile", w), "tile", GUI_FG,
+                      (x, rect.centery - self.f["tile"].get_height() // 2))
+
+    def rows(self, items, idx, top, badge_for=None):
+        """items: [(key, title, subtitle)]; scrolls to keep idx visible."""
+        pitch, h = self.s(84), self.s(72)
+        bottom = self.H - self.s(54) - self.s(16)
+        fit_n = max(1, (bottom - top) // pitch)
+        first = 0 if len(items) <= fit_n else max(0, min(idx - fit_n // 2, len(items) - fit_n))
+        for i in range(first, min(len(items), first + fit_n)):
+            key, title, sub = items[i]
+            r = self.pg.Rect(self.s(48), top + (i - first) * pitch, self.W - 2 * self.s(48), h)
+            self.row(r, i == idx, key, title, sub, badge_for(i) if badge_for else None)
+
+    def dim(self):
+        shade = self.pg.Surface((self.W, self.H), self.pg.SRCALPHA)
+        shade.fill((0, 0, 0, 165))
+        self.screen.blit(shade, (0, 0))
+
+    def spinner(self, center, radius):
+        import math
+        a = (self.pg.time.get_ticks() / 1000.0) * 2 * math.pi
+        rect = self.pg.Rect(0, 0, 2 * radius, 2 * radius)
+        rect.center = center
+        self.pg.draw.arc(self.screen, GUI_ACCENT, rect, a, a + 4.2, max(2, self.s(4)))
+
+    # ---------- input (keyboard; the launcher's .keys file turns the pad into these keys)
+    def keys(self):
+        pg = self.pg
+        out = []
+        now_ms = pg.time.get_ticks()
+        if self.script and now_ms >= self.next_inject:
+            tok = self.script[0]
+            if tok == "wait":
+                if not getattr(self, "busy", False):
+                    self.script.pop(0)
+            else:
+                self.script.pop(0)
+                self.next_inject = now_ms + 450
+                if tok == "shot":
+                    self.flip()
+                    self.shot()
+                else:
+                    out.append(tok)
+        for e in pg.event.get():
+            if e.type == pg.QUIT:
+                out.append("quit")
+            elif e.type == pg.KEYDOWN:
+                k = {pg.K_UP: "up", pg.K_DOWN: "down", pg.K_LEFT: "left", pg.K_RIGHT: "right",
+                     pg.K_TAB: "right", pg.K_RETURN: "ok", pg.K_KP_ENTER: "ok", pg.K_SPACE: "ok",
+                     pg.K_ESCAPE: "back", pg.K_BACKSPACE: "back", pg.K_PAGEUP: "pgup",
+                     pg.K_PAGEDOWN: "pgdn", pg.K_HOME: "home", pg.K_END: "end"}.get(e.key)
+                if k:
+                    out.append(k)
+        return out
+
+    def shot(self):
+        if self.shots:
+            self.shot_n += 1
+            self.pg.image.save(self.screen, os.path.join(self.shots, "gui-%02d.png" % self.shot_n))
+
+    def flip(self):
+        self.pg.display.flip()
+
+    def frame(self):
+        self.flip()
+        self.clock.tick(30)
+        if self.script == [] and self.shots and not getattr(self, "_ended", False):
+            self._ended = True
+            return ["quit"]
+        return self.keys()
+
+    # ---------- screens
+    def home_draw(self, steps, idx, nxt, st, board):
+        self._home = (steps, idx, nxt, st, board)
+        self.screen.blit(self.bg, (0, 0))
+        phase = st.get("phase") or "start"
+        if board == V3_BOARD:
+            sub = "You're on x86-64-v3. Integrate puts everything back with full functionality."
+        elif phase == "prepared":
+            sub = "Prepared. Start the x86-64-v3 upgrade from Updates & Downloads, or choose Update now."
+        else:
+            sub = "Moves this PC to the x86-64-v3 (Wayland) image and keeps your setup working."
+        top = self.header(MENU_TITLE, sub)
+        self.chip(board or "?", GUI_ACCENT, right_top=(self.W - self.s(48), self.s(34)))
+        st_txt = "Step: %s" % phase.replace("-", " ")
+        self.text(st_txt, "body", GUI_MUTED, (self.W - self.s(48) - self.f["body"].size(st_txt)[0],
+                                              self.s(34) + self.f["body"].get_height() + self.s(20)))
+        items = [(k, l.split("  - ")[0], l.split("  - ")[1] if "  - " in l else "") for k, l, _, _ in steps]
+        self.rows(items, idx, top, lambda i: ("NEXT", GUI_ACCENT) if steps[i][0] == nxt else None)
+        self.footer([("ok", "Select"), ("back", "Exit")], "x86-64-v3 Migration %s" % VERSION)
+
+    def confirm(self, under, title, body, default_yes=True, labels=("Yes", "No")):
+        """OK does the action, back backs out - the same two buttons as everywhere else in the menu
+        and in ES, so there is no highlight to move and nothing to mix up."""
+        pg = self.pg
+        names = self.button_names()
+        while True:
+            under()
+            self.dim()
+            w = min(self.W - 2 * self.s(120), self.s(860))
+            lines = self.wrap(body, "body", w - 2 * self.s(28))
+            lh = self.f["body"].get_height() + self.s(4)
+            h = self.s(28) + self.f["tile"].get_height() + self.s(18) + lh * len(lines) + self.s(30) + self.s(56) + self.s(24)
+            panel = pg.Rect(0, 0, w, h)
+            panel.center = (self.W // 2, self.H // 2)
+            self.tile(panel, radius=self.s(20), fill=(24, 31, 41))
+            pg.draw.rect(self.screen, GUI_ACCENT, panel, width=max(1, self.s(2)), border_radius=self.s(20))
+            x, y = panel.x + self.s(28), panel.y + self.s(28)
+            self.text(title, "tile", GUI_FG, (x, y))
+            y += self.f["tile"].get_height() + self.s(18)
+            for ln in lines:
+                self.text(ln, "body", GUI_FG, (x, y))
+                y += lh
+            bh = self.s(56)
+            right = panel.right - self.s(28)
+            for key, lbl, accent in (("back", labels[1], False), ("ok", labels[0], True)):
+                gw = max(self.f["body"].get_height() + self.s(6), self.f["key"].size(names[key])[0] + self.s(14))
+                bw = self.s(24) + gw + self.s(12) + self.f["tile"].size(lbl)[0] + self.s(24)
+                btn = pg.Rect(0, 0, bw, bh)
+                btn.bottomright = (right, panel.bottom - self.s(24))
+                self.tile(btn, accent, radius=self.s(12))
+                gx = btn.x + self.s(24)
+                self.button_glyph(gx, btn.centery - self.f["body"].get_height() // 2, names[key])
+                self.text(lbl, "tile", GUI_FG, (gx + gw + self.s(12), btn.centery - self.f["tile"].get_height() // 2))
+                right = btn.x - self.s(16)
+            self.footer([("ok", labels[0]), ("back", labels[1])])
+            for k in self.frame():
+                if k == "ok":
+                    return True
+                if k in ("back", "quit"):
+                    return False
+
+    def message(self, title, body):
+        while True:
+            self.screen.blit(self.bg, (0, 0))
+            top = self.header(title)
+            for ln in self.wrap(body, "body", self.W - 2 * self.s(48)):
+                self.text(ln, "body", GUI_FG, (self.s(48), top))
+                top += self.f["body"].get_height() + self.s(4)
+            self.footer([("ok", "OK")])
+            if any(k in ("ok", "back", "quit") for k in self.frame()):
+                return
+
+    def pick_drive(self):
+        targets = backup_targets()
+        idx = 0
+        items = [("drive", p, lbl) for p, lbl in targets]
+        while True:
+            self.screen.blit(self.bg, (0, 0))
+            top = self.header("Back up to...", "An external drive is safest. Needed: the files the scan found "
+                                               "plus the boot partition (about 5 GB).")
+            self.rows(items, idx, top)
+            self.footer([("ok", "Select"), ("back", "Back")])
+            for k in self.frame():
+                if k == "up":
+                    idx = max(0, idx - 1)
+                elif k == "down":
+                    idx = min(len(items) - 1, idx + 1)
+                elif k == "ok":
+                    return targets[idx][0]
+                elif k in ("back", "quit"):
+                    return None
+
+    def log_lines(self, width):
+        cw = max(1, self.f["mono"].size("M")[0])
+        cols = max(20, width // cw)
+        out = []
+        for ln in read(MENU_LAST).replace("\r", "").split("\n"):
+            ln = ln.expandtabs(4)
+            while len(ln) > cols:
+                out.append(ln[:cols])
+                ln = ln[cols:]
+            out.append(ln)
+        while out and not out[-1].strip():
+            out.pop()
+        return out
+
+    def watch(self, label, poll, attached=False, static=False, pid=None, cancel_text=""):
+        """Show a step's output live, then its result; with pid, B/Esc offers Cancel
+        (stop + put back what it changed). Returns the step's exit code."""
+        pg = self.pg
+        t0, t_end = pg.time.get_ticks(), None
+        ctl = StepCancel(pid, poll) if pid else None
+        rc, follow, offset = None, True, 0
+        view = {"offset": 0, "follow": True, "vis": 1, "most": 0}
+        self.busy = True
+
+        def draw():
+            self.screen.blit(self.bg, (0, 0))
+            secs = ((t_end or pg.time.get_ticks()) - t0) // 1000
+            state = ctl.state if ctl else ("done" if rc is not None else "running")
+            if static:
+                sub = "Full log: %s" % MENU_LOG
+            elif state == "running":
+                sub = "Running %d:%02d  -  it keeps going even if this window closes" % (secs // 60, secs % 60)
+            elif state == "stopping":
+                w = ctl.waiting_for()
+                sub = ("Stopping once this part is done (it must not be cut short): %s" % w) if w else "Stopping..."
+            elif state == "undoing":
+                sub = "Putting back what it changed..."
+            else:
+                sub = "Finished in %d:%02d. Full log: %s" % (secs // 60, secs % 60, MENU_LOG)
+            top = self.header(label, sub)
+            if state in ("running", "stopping", "undoing"):
+                self.spinner((self.W - self.s(70), self.s(52)), self.s(16))
+            elif static:
+                pass
+            elif ctl and ctl.cancelled:
+                if ctl.undo_rc == 0:
+                    self.chip("Cancelled - all put back", (196, 140, 40), right_top=(self.W - self.s(48), self.s(34)))
+                else:
+                    self.chip("Cancelled - undo incomplete", GUI_DANGER, right_top=(self.W - self.s(48), self.s(34)))
+            elif rc == 0:
+                self.chip("Done", GUI_SUCCESS, right_top=(self.W - self.s(48), self.s(34)))
+            else:
+                self.chip("Stopped (code %s)" % rc, GUI_DANGER, right_top=(self.W - self.s(48), self.s(34)))
+            box = pg.Rect(self.s(48), top, self.W - 2 * self.s(48), self.H - self.s(54) - self.s(16) - top)
+            pg.draw.rect(self.screen, GUI_FOOTER, box, border_radius=self.s(12))
+            pg.draw.rect(self.screen, (34, 45, 58), box, width=1, border_radius=self.s(12))
+            lines = self.log_lines(box.w - 2 * self.s(18))
+            lh = self.f["mono"].get_height() + self.s(2)
+            vis = max(1, (box.h - 2 * self.s(14)) // lh)
+            most = max(0, len(lines) - vis)
+            view["offset"] = most if view["follow"] else max(0, min(view["offset"], most))
+            view["vis"], view["most"] = vis, most
+            y = box.y + self.s(14)
+            for ln in lines[view["offset"]:view["offset"] + vis]:
+                color = GUI_DANGER if re.match(r"\s*(!|BLOCKER|STOP|ERROR|FAIL)", ln) else \
+                    GUI_SUCCESS if re.match(r"\s*\+ ", ln) else GUI_FG
+                self.text(ln, "mono", color, (box.x + self.s(18), y))
+                y += lh
+            if most:
+                bar_h = max(self.s(24), box.h * vis // len(lines))
+                bar_y = box.y + (box.h - bar_h) * view["offset"] // most
+                pg.draw.rect(self.screen, (60, 76, 96), (box.right - self.s(8), bar_y, self.s(4), bar_h),
+                             border_radius=self.s(2))
+            if state == "done" or static:
+                hints = [("ok", "Back")]
+            elif state == "running" and ctl:
+                hints = [("back", "Cancel")]
+            else:
+                hints = []
+            self.footer(hints + [("pgup", "Page up"), ("pgdn", "Page down")],
+                        "Started from this menu earlier" if attached else "")
+
+        while True:
+            if rc is None:
+                rc = ctl.tick() if ctl else poll()
+                if rc is not None:
+                    self.busy = False
+                    t_end = pg.time.get_ticks()
+            draw()
+            for k in self.frame():
+                if k in ("up", "pgup", "home"):
+                    view["follow"] = False
+                    view["offset"] = max(0, view["offset"] - (1 if k == "up" else view["vis"] if k == "pgup"
+                                                              else view["most"]))
+                elif k in ("down", "pgdn", "end"):
+                    view["offset"] = min(view["most"], view["offset"] + (1 if k == "down" else view["vis"]
+                                                                         if k == "pgdn" else view["most"]))
+                    view["follow"] = view["offset"] >= view["most"]
+                elif rc is not None and k in ("ok", "back", "quit"):
+                    return rc
+                elif rc is None and k == "back" and ctl and ctl.state == "running":
+                    if self.confirm(draw, "Cancel %s?" % label,
+                                    "It stops and puts back everything this step changed, so your system is "
+                                    "as it was before you started it." + (("\n\n" + cancel_text) if cancel_text
+                                                                         else ""), default_yes=False,
+                                    labels=("Stop and undo", "Keep going")):
+                        ctl.request()
+
+    def run(self):
+        if self.pad != "keyboard" and keys_out_of_date():
+            self.message(MENU_TITLE, "ES's confirm and back buttons were switched since this menu was last "
+                         "opened, so the buttons here don't match ES yet.\n\nThat is fixed now: close this "
+                         "and open V3 Migration again.")
+            return 0
+        info = step_running()
+        if info:
+            pid, marker = info["pid"], info.get("marker")
+            self.watch(info.get("label") or "Step", lambda: None if pid_alive(pid, marker) else 0, attached=True,
+                       pid=pid if (info.get("argv") or [""])[0] != "undo-step" else None)
+            try:
+                os.remove(P(MENU_RUN))
+            except OSError:
+                pass
+        self.offer_undo()
+        idx, last_nxt = 0, object()
+        while True:
+            st = load_json(STATE_DIR + "/state.json", {}) or {}
+            board = read(BOARD_FILE).strip()
+            if board not in (V1_BOARD, V3_BOARD):
+                self.message(MENU_TITLE, "This is for Batocera on PCs (x86_64 or x86-64-v3).\n\nThis system: %s"
+                             % (board or "unknown"))
+                return 2
+            steps, nxt = menu_steps(st, board)
+            if nxt != last_nxt:
+                idx = next((i for i, s_ in enumerate(steps) if s_[0] == nxt), 0)
+                last_nxt = nxt
+            idx = min(idx, len(steps) - 1)
+            self.home_draw(steps, idx, nxt, st, board)
+            for k in self.frame():
+                if k == "up":
+                    idx = max(0, idx - 1)
+                elif k == "down":
+                    idx = min(len(steps) - 1, idx + 1)
+                elif k in ("back", "quit"):
+                    return 0
+                elif k == "ok":
+                    rc = self.choose(steps[idx], st, board)
+                    if rc == "exit":
+                        return 0
+                    last_nxt = object()  # re-select the (new) next step
+                    break
+
+    def offer_undo(self):
+        """A step was cut off last time (power cut, crash, forced stop): offer to put things back."""
+        j = journal_pending()
+        if not j or step_running():
+            return
+        blank = lambda: self.screen.blit(self.bg, (0, 0))
+        while True:
+            if self.confirm(blank, "The last step didn't finish",
+                            "'%s' was stopped before it finished (cancelled, a power cut, or a crash), and "
+                            "some of its changes are still in place.\n\nPut back what it changed?" % j.get("label")):
+                proc = step_start(["undo-step"], "Putting things back")
+                step_finish(self.watch("Putting things back", proc.poll))
+                return
+            if self.confirm(blank, "Keep its changes?", "The system stays as the unfinished step left it, and "
+                                                         "this can't be undone afterwards.", default_yes=False):
+                proc = step_start(["undo-step", "--discard"], "Keeping the changes")
+                step_finish(self.watch("Keeping the changes", proc.poll))
+                return
+
+    def choose(self, step, st, board):
+        key, label, argv, question = step
+        title = label.split("  - ")[0]
+        under = lambda: self.home_draw(*self._home)
+        if key == "log":
+            if not os.path.exists(P(MENU_LAST)):
+                self.message("Last result", "Nothing has run from this menu yet.")
+            else:
+                self.watch("Last result", lambda: 0, static=True)
+            return None
+        if key == "backup":
+            dest = self.pick_drive()
+            if dest is None:
+                return None
+            argv = ["backup"] + (["--dest", dest] if dest != STATE_DIR + "/backups" else [])
+            question = "Back up to %s?\n\nThis can take a while on a slow drive." % dest
+            under = lambda: self.screen.blit(self.bg, (0, 0))
+        if question and not self.confirm(under, title, question, default_yes=key not in NO_CONFIRM_DEFAULT):
+            return None
+        proc = step_start(argv, title)
+        rc = self.watch(title, proc.poll, pid=proc.pid, cancel_text=CANCEL_NOTES.get(key, ""))
+        step_finish(rc)
+        if key == "update-now" and rc == 0 and self.confirm(lambda: self.screen.blit(self.bg, (0, 0)),
+                                                             "Reboot now?", "The x86-64-v3 image is installed. "
+                                                             "Reboot now to start it?"):
+            if not TEST_MODE():
+                subprocess.run(["sync"])
+                subprocess.run(["reboot"])
+            return "exit"
+        return None
+
+
+def cmd_gui(args):
+    os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
+    if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+        say("Full-screen menu unavailable (no display); use: menu")
+        return GUI_UNAVAILABLE
+    try:
+        import pygame
+        pygame.display.init()
+        pygame.font.init()
+        driver = pygame.display.get_driver()
+        if driver in ("offscreen", "dummy", "evdev"):
+            pygame.quit()
+            raise RuntimeError("no usable display (SDL driver %s)" % driver)
+    except Exception as e:  # no pygame or no display: the launcher falls back to the terminal menu
+        say("Full-screen menu unavailable (%s); use: menu" % e)
+        return GUI_UNAVAILABLE
+    try:
+        shots = getattr(args, "shots", None)
+        if shots:
+            os.makedirs(shots, exist_ok=True)
+        script = [t for t in (getattr(args, "script", None) or "").split(",") if t]
+        return MigrateGui(pygame, windowed=getattr(args, "windowed", False), script=script, shots=shots).run()
+    finally:
+        pygame.quit()
+
+
 def main(argv=None):
     global ROOT, ASSUME_YES
     ap = argparse.ArgumentParser(prog="batocera_v3_migrate.py",
                                  description="Safe Batocera x86_64 -> x86-64-v3 migration (v%s)" % VERSION)
     ap.add_argument("--yes", action="store_true", help="don't ask for typed confirmations")
     ap.add_argument("--root", default="/", help=argparse.SUPPRESS)  # testing against a mock tree
+    ap.add_argument("--journal", action="store_true", help=argparse.SUPPRESS)  # set by the menu: makes Cancel possible
     sub = ap.add_subparsers(dest="cmd")
     sub.add_parser("scan", help="1. find everything the x86-64-v3 update affects")
     b = sub.add_parser("backup", help="2. back up those things (+ boot partition for rollback)")
@@ -3154,12 +4715,45 @@ def main(argv=None):
     fx.add_argument("--apply", nargs="+", metavar="FIX",
                     help="hook-guard, launch-watchdog, hooks, hook-backups, xwayland-access, hook-unguard, or all")
     sub.add_parser("status")
+    un = sub.add_parser("undo-step", help="put back what a cancelled or interrupted menu step changed")
+    un.add_argument("--discard", action="store_true", help="keep the changes; just drop the undo record")
+    la = sub.add_parser("launcher", help="add/remove 'V3 Migration' in ES's Ports list (controller menu)")
+    la.add_argument("action", nargs="?", choices=["install", "remove", "status"], default="status")
+    sub.add_parser("menu", help="the terminal menu (the launcher's fallback when the full-screen menu can't start)")
+    gu = sub.add_parser("gui", help="the full-screen menu the Ports launcher opens")
+    gu.add_argument("--windowed", action="store_true", help="1280x720 window instead of full screen")
+    gu.add_argument("--script", help=argparse.SUPPRESS)   # tests: comma-separated keys to press
+    gu.add_argument("--shots", help=argparse.SUPPRESS)    # tests: save screenshots here
     pl = sub.add_parser("init-plugin", help="create an integration template")
     pl.add_argument("name")
     pl.add_argument("--force", action="store_true")
     args = ap.parse_args(argv)
     ROOT = os.path.abspath(args.root)
     ASSUME_YES = args.yes
+    read_only = args.cmd in ("status", "audit", "verify-backup", "undo-step", "menu", "gui", "init-plugin") or \
+        (args.cmd == "launcher" and args.action == "status") or (args.cmd == "fix" and not args.apply) or \
+        (args.cmd == "check" and not args.apply)
+    if not read_only and journal_pending():
+        say("A cancelled or interrupted step left changes behind; nothing else can change until they are dealt "
+            "with.\nRun: undo-step   (or: undo-step --discard to keep them)")
+        return 2
+    if args.journal and args.cmd not in (None, "undo-step", "menu", "gui", "launcher"):
+        journal_start(args.cmd)
+        cancelled = False
+        try:
+            return dispatch(args)
+        except SystemExit as e:
+            if e.code != CANCEL_RC:
+                raise
+            cancelled = True
+            say("\nCancelled. Putting back what this step changed...")
+            return CANCEL_RC
+        finally:
+            journal_stop(keep=cancelled)
+    return dispatch(args)
+
+
+def dispatch(args):
     if not args.cmd:
         return cmd_auto(args)
     if args.cmd == "backup":
@@ -3173,7 +4767,8 @@ def main(argv=None):
     return {"scan": cmd_scan, "update": cmd_update, "integrate": cmd_integrate_all,
             "audit": cmd_audit, "verify-backup": cmd_verify_backup,
             "migrate": cmd_migrate, "check": cmd_integrate, "rollback": cmd_rollback,
-            "status": cmd_status, "fix": cmd_fix, "prepare": cmd_prepare, "unprepare": cmd_unprepare, "init-plugin": cmd_init_plugin}[args.cmd](args)
+            "status": cmd_status, "fix": cmd_fix, "prepare": cmd_prepare, "unprepare": cmd_unprepare, "init-plugin": cmd_init_plugin,
+            "launcher": cmd_launcher, "menu": cmd_menu, "gui": cmd_gui, "undo-step": cmd_undo_step}[args.cmd](args)
 
 
 if __name__ == "__main__":
