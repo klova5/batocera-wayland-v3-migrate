@@ -3133,12 +3133,13 @@ LAUNCHER_SRC = """#!/bin/bash
 %(mark)s
 # x86-64-v3 Migration menu, opened from ES's Ports list. Written by
 #   batocera_v3_migrate.py launcher install      (remove with: launcher remove)
-# Controller: D-pad/stick move, B or Start = OK, A or Select = back, L1/R1 = page.
+# Controller (through the .keys file): D-pad/stick move, OK = south button or Start,
+# back = east button or Select, L1/R1 = page up/down.
 TOOL=%(tool)s
 for t in "$TOOL" %(places)s; do
     if [ -f "$t" ]; then TOOL="$t"; break; fi
 done
-export DISPLAY="${DISPLAY:-:0}"
+export DISPLAY="${DISPLAY:-:0.0}"
 LOG=/userdata/system/logs/v3-migrate-menu.log
 mkdir -p /userdata/system/logs
 if [ ! -f "$TOOL" ]; then
@@ -3147,6 +3148,9 @@ if [ ! -f "$TOOL" ]; then
         http://127.0.0.1:1234/messagebox >/dev/null 2>&1
     exit 1
 fi
+# the full-screen menu (pygame, like the BUA app); exit code 3 = it can't start here
+python3 -B "$TOOL" gui 2>>"$LOG"
+[ $? -ne 3 ] && exit 0
 if command -v xterm >/dev/null 2>&1; then
     xterm -fs 20 -maximized -fg white -bg black -fa DejaVuSansMono -en UTF-8 \\
         -T "x86-64-v3 Migration" -e python3 -B "$TOOL" menu 2>>"$LOG"
@@ -3406,17 +3410,15 @@ def menu_steps(st, board):
     return steps, nxt
 
 
-def menu_run(ui, argv, label):
-    """Run one step of this tool in its own session (so closing the window can't cut it off),
-    showing its output live; then show the result. Returns the exit code."""
+def step_start(argv, label):
+    """Start one step of this tool in its own session, so closing the window (or the exit
+    hotkey) can't cut it off. Output goes to MENU_LAST. Returns the Popen."""
     os.makedirs(os.path.dirname(P(MENU_LAST)), exist_ok=True)
     os.makedirs(os.path.dirname(P(MENU_LOG)), exist_ok=True)
     cmd = [sys.executable, "-u", "-B", os.path.abspath(__file__), "--yes"]
     if TEST_MODE():
         cmd += ["--root", ROOT]
     cmd += argv
-    ui.clear()
-    say("== %s ==  (keep this window open; the step finishes even if it closes)\n" % label)
     with open(P(MENU_LAST), "w") as fh:
         fh.write("%s  %s: %s\n\n" % (now(), label, " ".join(argv)))
         fh.flush()
@@ -3424,7 +3426,10 @@ def menu_run(ui, argv, label):
                                 start_new_session=True, close_fds=True)
     write_json(MENU_RUN, {"pid": proc.pid, "label": label, "argv": argv, "start": now(),
                           "marker": os.path.basename(__file__)})
-    rc = menu_follow(lambda: proc.poll())
+    return proc
+
+
+def step_finish(rc):
     try:
         os.remove(P(MENU_RUN))
     except OSError:
@@ -3433,6 +3438,28 @@ def menu_run(ui, argv, label):
         fh.write("\n%s  exit code %s\n" % (now(), rc))
     with open(P(MENU_LOG), "a") as fh:
         fh.write(read(MENU_LAST) + "\n")
+
+
+def step_running():
+    """The MENU_RUN record of a step that is still running (started by an earlier menu), or None."""
+    info = load_json(MENU_RUN)
+    if info and pid_alive(info.get("pid"), info.get("marker")):
+        return info
+    if info:
+        try:
+            os.remove(P(MENU_RUN))
+        except OSError:
+            pass
+    return None
+
+
+def menu_run(ui, argv, label):
+    """Run one step, showing its output live; then show the result. Returns the exit code."""
+    ui.clear()
+    say("== %s ==  (keep this window open; the step finishes even if it closes)\n" % label)
+    proc = step_start(argv, label)
+    rc = menu_follow(lambda: proc.poll())
+    step_finish(rc)
     ui.textbox(P(MENU_LAST), "%s: %s" % (label, "done" if rc == 0 else "stopped (code %s)" % rc))
     return rc
 
@@ -3460,18 +3487,17 @@ def menu_follow(poll, interval=0.3):
 
 def cmd_menu(args):
     ui = menu_ui()
-    run_info = load_json(MENU_RUN)
-    if run_info and pid_alive(run_info.get("pid"), run_info.get("marker")):
+    run_info = step_running()
+    if run_info:
         ui.clear()
         say("== %s is still running (started %s) ==\n" % (run_info.get("label"), run_info.get("start")))
         pid, marker = run_info["pid"], run_info.get("marker")
         menu_follow(lambda: None if pid_alive(pid, marker) else 0, interval=1)
-        ui.textbox(P(MENU_LAST), "%s: finished" % run_info.get("label"))
-    if run_info:
         try:
             os.remove(P(MENU_RUN))
         except OSError:
             pass
+        ui.textbox(P(MENU_LAST), "%s: finished" % run_info.get("label"))
     while True:
         st = load_json(STATE_DIR + "/state.json", {}) or {}
         board = read(BOARD_FILE).strip()
@@ -3508,6 +3534,534 @@ def cmd_menu(args):
                 subprocess.run(["sync"])
                 subprocess.run(["reboot"])
             return 0
+
+
+# ---- the full-screen menu (pygame, styled after the BUA app); the dialog menu is the fallback
+GUI_UNAVAILABLE = 3          # exit code the launcher reads as "use the terminal menu instead"
+GUI_BG = (10, 13, 18)
+GUI_CARD = (27, 35, 45)
+GUI_CARD_HI = (36, 48, 62)
+GUI_ACCENT = (58, 166, 255)
+GUI_FG = (236, 242, 248)
+GUI_MUTED = (139, 152, 166)
+GUI_SUCCESS = (76, 205, 140)
+GUI_DANGER = (232, 96, 96)
+GUI_FOOTER = (6, 8, 12)
+GUI_TILE_COLORS = {"scan": (64, 116, 214), "backup": (136, 92, 214), "prepare": (214, 118, 62),
+                   "update-now": (40, 156, 136), "unprepare": (190, 150, 36), "integrate": (40, 156, 136),
+                   "status": (52, 138, 186), "log": (92, 148, 58), "drive": (64, 116, 214)}
+GUI_TILE_TEXT = {"scan": "1", "backup": "2", "prepare": "3", "update-now": "4", "unprepare": "↺",
+                 "integrate": "4", "status": "i", "log": "≡", "drive": "▤"}
+# Button names per controller family. ES's "b" (south) is OK and "a" (east) is back,
+# which is what the launcher's .keys file turns into Enter and Esc.
+GUI_PADS = {"nintendo": {"ok": "B", "back": "A", "pgup": "L", "pgdn": "R"},
+            "xbox": {"ok": "A", "back": "B", "pgup": "LB", "pgdn": "RB"},
+            "playstation": {"ok": "✕", "back": "○", "pgup": "L1", "pgdn": "R1"},
+            "keyboard": {"ok": "Enter", "back": "Esc", "pgup": "PgUp", "pgdn": "PgDn"}}
+NO_CONFIRM_DEFAULT = ("update-now", "unprepare")   # these dialogs start on "No"
+
+
+class MigrateGui:
+    def __init__(self, pg, windowed=False, script=None, shots=None):
+        self.pg = pg
+        os.environ.setdefault("SDL_VIDEO_WINDOW_POS", "0,0")
+        if windowed:
+            self.screen = pg.display.set_mode((1280, 720))
+        else:
+            info = pg.display.Info()
+            self.screen = pg.display.set_mode((info.current_w, info.current_h), pg.NOFRAME)
+        pg.display.set_caption(MENU_TITLE)
+        pg.mouse.set_visible(False)
+        pg.key.set_repeat(350, 70)
+        self.W, self.H = self.screen.get_size()
+        self.k = max(1.0, min(self.W / 1280.0, self.H / 720.0))
+        f = lambda size, bold=False, mono=False: pg.font.SysFont(
+            "DejaVu Sans Mono" if mono else "DejaVu Sans", self.s(size), bold=bold)
+        self.f = {"hero": f(30, True), "tile": f(20, True), "body": f(17), "small": f(14),
+                  "mono": f(15, mono=True), "glyph": f(26, True), "key": f(14, True)}
+        self.bg = self._background()
+        self.clock = pg.time.Clock()
+        self.pad = os.environ.get("V3M_PAD") if os.environ.get("V3M_PAD") in GUI_PADS else self._pad_style()
+        self.script = list(script or [])
+        self.shots, self.shot_n, self.next_inject = shots, 0, 0
+
+    def s(self, n):
+        return int(round(n * self.k))
+
+    # ---------- drawing helpers (same look as the BUA app)
+    def _background(self):
+        pg = self.pg
+        surf = pg.Surface((self.W, self.H)).convert()
+        top = (16, 22, 32)
+        for i in range(self.H):
+            t = i / max(1, self.H - 1)
+            pg.draw.line(surf, tuple(int(top[c] + (GUI_BG[c] - top[c]) * t) for c in range(3)), (0, i), (self.W, i))
+        glow = pg.Surface((64, 36), pg.SRCALPHA)
+        for r in range(28, 0, -1):
+            pg.draw.circle(glow, (*GUI_ACCENT, int(5 * (28 - r) / 28) + 1), (8, 4), r)
+        surf.blit(pg.transform.smoothscale(glow, (self.W, self.H)), (0, 0))
+        return surf
+
+    def _pad_style(self):
+        pg = self.pg
+        try:
+            pg.joystick.init()
+            names = " ".join((pg.joystick.Joystick(i).get_name() or "").lower()
+                             for i in range(pg.joystick.get_count()))
+        except Exception:
+            names = ""
+        if not names.strip():
+            return "keyboard"
+        if any(x in names for x in ("sony", "playstation", "dualsense", "dualshock")):
+            return "playstation"
+        if any(x in names for x in ("nintendo", "pro controller", "switch", "joy-con")):
+            return "nintendo"
+        return "xbox"
+
+    def text(self, txt, font, color, pos):
+        img = self.f[font].render(txt, True, color)
+        self.screen.blit(img, pos)
+        return img.get_width()
+
+    def fit(self, txt, font, width):
+        fnt = self.f[font]
+        if fnt.size(txt)[0] <= width:
+            return txt
+        while txt and fnt.size(txt + "...")[0] > width:
+            txt = txt[:-1]
+        return txt.rstrip() + "..."
+
+    def wrap(self, txt, font, width):
+        out = []
+        for para in txt.split("\n"):
+            line = ""
+            for word in para.split(" "):
+                trial = (line + " " + word).strip()
+                if self.f[font].size(trial)[0] <= width or not line:
+                    line = trial
+                else:
+                    out.append(line)
+                    line = word
+            out.append(line)
+        return out
+
+    def tile(self, rect, selected=False, radius=None, fill=None, accent=None):
+        pg = self.pg
+        radius = self.s(14) if radius is None else radius
+        shadow = pg.Surface(rect.size, pg.SRCALPHA)
+        pg.draw.rect(shadow, (0, 0, 0, 110), shadow.get_rect(), border_radius=radius)
+        self.screen.blit(shadow, rect.move(0, self.s(5)))
+        pg.draw.rect(self.screen, fill or (GUI_CARD_HI if selected else GUI_CARD), rect, border_radius=radius)
+        if selected:
+            pg.draw.rect(self.screen, accent or GUI_ACCENT, rect, width=max(2, self.s(3)), border_radius=radius)
+
+    def chip(self, txt, color, right_top=None, left_mid=None):
+        img = self.f["body"].render(txt, True, GUI_FG)
+        r = self.pg.Rect(0, 0, img.get_width() + self.s(28), img.get_height() + self.s(12))
+        if right_top:
+            r.topright = right_top
+        else:
+            r.midleft = left_mid
+        self.pg.draw.rect(self.screen, color, r, border_radius=r.h // 2)
+        self.screen.blit(img, img.get_rect(center=r.center))
+        return r
+
+    def header(self, title, subtitle=""):
+        m, y = self.s(48), self.s(28)
+        self.text(self.fit(title, "hero", self.W - 2 * m - self.s(260)), "hero", GUI_FG, (m, y))
+        y += self.f["hero"].get_height() + self.s(4)
+        if subtitle:
+            self.text(self.fit(subtitle, "body", self.W - 2 * m), "body", GUI_MUTED, (m, y))
+            y += self.f["body"].get_height()
+        return y + self.s(24)
+
+    def button_glyph(self, x, y, name):
+        """A round controller button (or a keycap) with its label; returns the width."""
+        pg, fnt = self.pg, self.f["key"]
+        img = fnt.render(name, True, GUI_FG)
+        h = self.f["body"].get_height() + self.s(6)
+        w = max(h, img.get_width() + self.s(14))
+        r = pg.Rect(x, y - self.s(3), w, h)
+        pg.draw.rect(self.screen, (48, 62, 80), r, border_radius=h // 2 if len(name) <= 2 else self.s(6))
+        pg.draw.rect(self.screen, (98, 116, 138), r, width=max(1, self.s(2)),
+                     border_radius=h // 2 if len(name) <= 2 else self.s(6))
+        self.screen.blit(img, img.get_rect(center=r.center))
+        return w
+
+    def footer(self, hints, status=""):
+        """hints: [(button key in GUI_PADS, label)]"""
+        pg = self.pg
+        h = self.s(54)
+        pg.draw.rect(self.screen, GUI_FOOTER, (0, self.H - h, self.W, h))
+        pg.draw.line(self.screen, (34, 45, 58), (0, self.H - h), (self.W, self.H - h), 1)
+        y = self.H - h + (h - self.f["body"].get_height()) // 2
+        names = GUI_PADS[self.pad]
+        parts = []
+        for key, label in hints:
+            parts.append((names.get(key, key), label))
+        widths = [self.f["body"].size(lbl)[0] + max(self.f["body"].get_height() + self.s(6),
+                                                     self.f["key"].size(n)[0] + self.s(14)) + self.s(10)
+                  for n, lbl in parts]
+        x = self.W - self.s(48) - sum(widths) - self.s(36) * max(0, len(parts) - 1)
+        if status:
+            self.text(self.fit(status, "body", max(0, x - self.s(96))), "body", GUI_MUTED, (self.s(48), y))
+        for (n, lbl), w in zip(parts, widths):
+            gw = self.button_glyph(x, y, n)
+            self.text(lbl, "body", GUI_FG, (x + gw + self.s(10), y))
+            x += w + self.s(36)
+
+    def row(self, rect, selected, key, title, subtitle="", badge=None):
+        pg = self.pg
+        self.tile(rect, selected, radius=self.s(12))
+        mono = rect.h - self.s(16)
+        mrect = pg.Rect(rect.x + self.s(8), rect.y + self.s(8), int(mono * 1.25), mono)
+        pg.draw.rect(self.screen, GUI_TILE_COLORS.get(key, (64, 116, 214)), mrect, border_radius=self.s(10))
+        g = self.f["glyph"].render(GUI_TILE_TEXT.get(key, "?"), True, GUI_FG)
+        self.screen.blit(g, g.get_rect(center=mrect.center))
+        x = mrect.right + self.s(18)
+        right = rect.right - self.s(18)
+        if badge:
+            img = self.f["small"].render(badge[0], True, GUI_FG)
+            b = pg.Rect(0, 0, img.get_width() + self.s(20), img.get_height() + self.s(8))
+            b.midright = (right, rect.centery)
+            pg.draw.rect(self.screen, badge[1], b, border_radius=b.h // 2)
+            self.screen.blit(img, img.get_rect(center=b.center))
+            right = b.x - self.s(14)
+        w = right - x
+        if subtitle:
+            y = rect.centery - (self.f["tile"].get_height() + self.f["small"].get_height() + self.s(2)) // 2
+            self.text(self.fit(title, "tile", w), "tile", GUI_FG, (x, y))
+            self.text(self.fit(subtitle, "small", w), "small", GUI_MUTED,
+                      (x, y + self.f["tile"].get_height() + self.s(2)))
+        else:
+            self.text(self.fit(title, "tile", w), "tile", GUI_FG,
+                      (x, rect.centery - self.f["tile"].get_height() // 2))
+
+    def rows(self, items, idx, top, badge_for=None):
+        """items: [(key, title, subtitle)]; scrolls to keep idx visible."""
+        pitch, h = self.s(84), self.s(72)
+        bottom = self.H - self.s(54) - self.s(16)
+        fit_n = max(1, (bottom - top) // pitch)
+        first = 0 if len(items) <= fit_n else max(0, min(idx - fit_n // 2, len(items) - fit_n))
+        for i in range(first, min(len(items), first + fit_n)):
+            key, title, sub = items[i]
+            r = self.pg.Rect(self.s(48), top + (i - first) * pitch, self.W - 2 * self.s(48), h)
+            self.row(r, i == idx, key, title, sub, badge_for(i) if badge_for else None)
+
+    def dim(self):
+        shade = self.pg.Surface((self.W, self.H), self.pg.SRCALPHA)
+        shade.fill((0, 0, 0, 165))
+        self.screen.blit(shade, (0, 0))
+
+    def spinner(self, center, radius):
+        import math
+        a = (self.pg.time.get_ticks() / 1000.0) * 2 * math.pi
+        rect = self.pg.Rect(0, 0, 2 * radius, 2 * radius)
+        rect.center = center
+        self.pg.draw.arc(self.screen, GUI_ACCENT, rect, a, a + 4.2, max(2, self.s(4)))
+
+    # ---------- input (keyboard; the launcher's .keys file turns the pad into these keys)
+    def keys(self):
+        pg = self.pg
+        out = []
+        now_ms = pg.time.get_ticks()
+        if self.script and now_ms >= self.next_inject:
+            tok = self.script[0]
+            if tok == "wait":
+                if not getattr(self, "busy", False):
+                    self.script.pop(0)
+            else:
+                self.script.pop(0)
+                self.next_inject = now_ms + 450
+                if tok == "shot":
+                    self.flip()
+                    self.shot()
+                else:
+                    out.append(tok)
+        for e in pg.event.get():
+            if e.type == pg.QUIT:
+                out.append("quit")
+            elif e.type == pg.KEYDOWN:
+                k = {pg.K_UP: "up", pg.K_DOWN: "down", pg.K_LEFT: "left", pg.K_RIGHT: "right",
+                     pg.K_TAB: "right", pg.K_RETURN: "ok", pg.K_KP_ENTER: "ok", pg.K_SPACE: "ok",
+                     pg.K_ESCAPE: "back", pg.K_BACKSPACE: "back", pg.K_PAGEUP: "pgup",
+                     pg.K_PAGEDOWN: "pgdn", pg.K_HOME: "home", pg.K_END: "end"}.get(e.key)
+                if k:
+                    out.append(k)
+        return out
+
+    def shot(self):
+        if self.shots:
+            self.shot_n += 1
+            self.pg.image.save(self.screen, os.path.join(self.shots, "gui-%02d.png" % self.shot_n))
+
+    def flip(self):
+        self.pg.display.flip()
+
+    def frame(self):
+        self.flip()
+        self.clock.tick(30)
+        if self.script == [] and self.shots and not getattr(self, "_ended", False):
+            self._ended = True
+            return ["quit"]
+        return self.keys()
+
+    # ---------- screens
+    def home_draw(self, steps, idx, nxt, st, board):
+        self._home = (steps, idx, nxt, st, board)
+        self.screen.blit(self.bg, (0, 0))
+        phase = st.get("phase") or "start"
+        if board == V3_BOARD:
+            sub = "You're on x86-64-v3. Integrate puts everything back with full functionality."
+        elif phase == "prepared":
+            sub = "Prepared. Start the x86-64-v3 upgrade from Updates & Downloads, or choose Update now."
+        else:
+            sub = "Moves this PC to the x86-64-v3 (Wayland) image and keeps your setup working."
+        top = self.header(MENU_TITLE, sub)
+        self.chip(board or "?", GUI_ACCENT, right_top=(self.W - self.s(48), self.s(34)))
+        st_txt = "Step: %s" % phase.replace("-", " ")
+        self.text(st_txt, "body", GUI_MUTED, (self.W - self.s(48) - self.f["body"].size(st_txt)[0],
+                                              self.s(34) + self.f["body"].get_height() + self.s(20)))
+        items = [(k, l.split("  - ")[0], l.split("  - ")[1] if "  - " in l else "") for k, l, _, _ in steps]
+        self.rows(items, idx, top, lambda i: ("NEXT", GUI_ACCENT) if steps[i][0] == nxt else None)
+        self.footer([("ok", "Select"), ("back", "Exit")], "x86-64-v3 Migration %s" % VERSION)
+
+    def confirm(self, under, title, body, default_yes=True):
+        sel = 0 if default_yes else 1
+        while True:
+            under()
+            self.dim()
+            pg = self.pg
+            w = min(self.W - 2 * self.s(120), self.s(860))
+            lines = self.wrap(body, "body", w - 2 * self.s(28))
+            lh = self.f["body"].get_height() + self.s(4)
+            h = self.s(28) + self.f["tile"].get_height() + self.s(18) + lh * len(lines) + self.s(30) + self.s(56) + self.s(24)
+            panel = pg.Rect(0, 0, w, h)
+            panel.center = (self.W // 2, self.H // 2)
+            self.tile(panel, radius=self.s(20), fill=(24, 31, 41))
+            pg.draw.rect(self.screen, GUI_ACCENT, panel, width=max(1, self.s(2)), border_radius=self.s(20))
+            x, y = panel.x + self.s(28), panel.y + self.s(28)
+            self.text(title, "tile", GUI_FG, (x, y))
+            y += self.f["tile"].get_height() + self.s(18)
+            for ln in lines:
+                self.text(ln, "body", GUI_FG, (x, y))
+                y += lh
+            bw, bh = self.s(170), self.s(56)
+            for i, lbl in enumerate(("Yes", "No")):
+                b = pg.Rect(0, 0, bw, bh)
+                b.bottomright = (panel.right - self.s(28) - (1 - i) * (bw + self.s(16)), panel.bottom - self.s(24))
+                self.tile(b, i == sel, radius=self.s(12))
+                img = self.f["tile"].render(lbl, True, GUI_FG)
+                self.screen.blit(img, img.get_rect(center=b.center))
+            self.footer([("ok", "Choose"), ("back", "Cancel")])
+            for k in self.frame():
+                if k in ("left", "right", "up", "down"):
+                    sel = 1 - sel
+                elif k == "ok":
+                    return sel == 0
+                elif k in ("back", "quit"):
+                    return False
+
+    def message(self, title, body):
+        while True:
+            self.screen.blit(self.bg, (0, 0))
+            top = self.header(title)
+            for ln in self.wrap(body, "body", self.W - 2 * self.s(48)):
+                self.text(ln, "body", GUI_FG, (self.s(48), top))
+                top += self.f["body"].get_height() + self.s(4)
+            self.footer([("ok", "OK")])
+            if any(k in ("ok", "back", "quit") for k in self.frame()):
+                return
+
+    def pick_drive(self):
+        targets = backup_targets()
+        idx = 0
+        items = [("drive", p, lbl) for p, lbl in targets]
+        while True:
+            self.screen.blit(self.bg, (0, 0))
+            top = self.header("Back up to...", "An external drive is safest. Needed: the files the scan found "
+                                               "plus the boot partition (about 5 GB).")
+            self.rows(items, idx, top)
+            self.footer([("ok", "Select"), ("back", "Back")])
+            for k in self.frame():
+                if k == "up":
+                    idx = max(0, idx - 1)
+                elif k == "down":
+                    idx = min(len(items) - 1, idx + 1)
+                elif k == "ok":
+                    return targets[idx][0]
+                elif k in ("back", "quit"):
+                    return None
+
+    def log_lines(self, width):
+        cw = max(1, self.f["mono"].size("M")[0])
+        cols = max(20, width // cw)
+        out = []
+        for ln in read(MENU_LAST).replace("\r", "").split("\n"):
+            ln = ln.expandtabs(4)
+            while len(ln) > cols:
+                out.append(ln[:cols])
+                ln = ln[cols:]
+            out.append(ln)
+        while out and not out[-1].strip():
+            out.pop()
+        return out
+
+    def watch(self, label, poll, attached=False, static=False):
+        """Show a running step's output live, then its result. Returns the exit code."""
+        pg = self.pg
+        t0 = pg.time.get_ticks()
+        rc, follow, offset = None, True, 0
+        self.busy = True
+        while True:
+            if rc is None:
+                rc = poll()
+                if rc is not None:
+                    self.busy = False
+                    t_end = pg.time.get_ticks()
+            self.screen.blit(self.bg, (0, 0))
+            secs = ((t_end if rc is not None else pg.time.get_ticks()) - t0) // 1000
+            if static:
+                sub = "Full log: %s" % MENU_LOG
+            elif rc is None:
+                sub = "Running %d:%02d  -  it keeps going even if this window closes" % (secs // 60, secs % 60)
+            else:
+                sub = "Finished in %d:%02d. Full log: %s" % (secs // 60, secs % 60, MENU_LOG)
+            top = self.header(label, sub)
+            if rc is None:
+                self.spinner((self.W - self.s(70), self.s(52)), self.s(16))
+            elif static:
+                pass
+            elif rc == 0:
+                self.chip("Done", GUI_SUCCESS, right_top=(self.W - self.s(48), self.s(34)))
+            else:
+                self.chip("Stopped (code %s)" % rc, GUI_DANGER, right_top=(self.W - self.s(48), self.s(34)))
+            box = pg.Rect(self.s(48), top, self.W - 2 * self.s(48), self.H - self.s(54) - self.s(16) - top)
+            pg.draw.rect(self.screen, GUI_FOOTER, box, border_radius=self.s(12))
+            pg.draw.rect(self.screen, (34, 45, 58), box, width=1, border_radius=self.s(12))
+            lines = self.log_lines(box.w - 2 * self.s(18))
+            lh = self.f["mono"].get_height() + self.s(2)
+            vis = max(1, (box.h - 2 * self.s(14)) // lh)
+            most = max(0, len(lines) - vis)
+            offset = most if follow else max(0, min(offset, most))
+            y = box.y + self.s(14)
+            for ln in lines[offset:offset + vis]:
+                color = GUI_DANGER if re.match(r"\s*(!|BLOCKER|STOP|ERROR|FAIL)", ln) else \
+                    GUI_SUCCESS if re.match(r"\s*\+ ", ln) else GUI_FG
+                self.text(ln, "mono", color, (box.x + self.s(18), y))
+                y += lh
+            if most:
+                bar_h = max(self.s(24), box.h * vis // len(lines))
+                bar_y = box.y + (box.h - bar_h) * offset // most
+                pg.draw.rect(self.screen, (60, 76, 96), (box.right - self.s(8), bar_y, self.s(4), bar_h),
+                             border_radius=self.s(2))
+            hints = ([("ok", "Back")] if rc is not None else []) + [("pgup", "Page up"), ("pgdn", "Page down")]
+            self.footer(hints, "Started from this menu earlier" if attached else "")
+            for k in self.frame():
+                if k in ("up", "pgup", "home"):
+                    follow = False
+                    offset = max(0, offset - (1 if k == "up" else vis if k == "pgup" else most))
+                elif k in ("down", "pgdn", "end"):
+                    offset = min(most, offset + (1 if k == "down" else vis if k == "pgdn" else most))
+                    follow = offset >= most
+                elif k in ("ok", "back") and rc is not None:
+                    return rc
+                elif k == "quit" and rc is not None:
+                    return rc
+
+    def run(self):
+        info = step_running()
+        if info:
+            pid, marker = info["pid"], info.get("marker")
+            self.watch(info.get("label") or "Step", lambda: None if pid_alive(pid, marker) else 0, attached=True)
+            try:
+                os.remove(P(MENU_RUN))
+            except OSError:
+                pass
+        idx, last_nxt = 0, object()
+        while True:
+            st = load_json(STATE_DIR + "/state.json", {}) or {}
+            board = read(BOARD_FILE).strip()
+            if board not in (V1_BOARD, V3_BOARD):
+                self.message(MENU_TITLE, "This is for Batocera on PCs (x86_64 or x86-64-v3).\n\nThis system: %s"
+                             % (board or "unknown"))
+                return 2
+            steps, nxt = menu_steps(st, board)
+            if nxt != last_nxt:
+                idx = next((i for i, s_ in enumerate(steps) if s_[0] == nxt), 0)
+                last_nxt = nxt
+            idx = min(idx, len(steps) - 1)
+            self.home_draw(steps, idx, nxt, st, board)
+            for k in self.frame():
+                if k == "up":
+                    idx = max(0, idx - 1)
+                elif k == "down":
+                    idx = min(len(steps) - 1, idx + 1)
+                elif k in ("back", "quit"):
+                    return 0
+                elif k == "ok":
+                    rc = self.choose(steps[idx], st, board)
+                    if rc == "exit":
+                        return 0
+                    last_nxt = object()  # re-select the (new) next step
+                    break
+
+    def choose(self, step, st, board):
+        key, label, argv, question = step
+        title = label.split("  - ")[0]
+        under = lambda: self.home_draw(*self._home)
+        if key == "log":
+            if not os.path.exists(P(MENU_LAST)):
+                self.message("Last result", "Nothing has run from this menu yet.")
+            else:
+                self.watch("Last result", lambda: 0, static=True)
+            return None
+        if key == "backup":
+            dest = self.pick_drive()
+            if dest is None:
+                return None
+            argv = ["backup"] + (["--dest", dest] if dest != STATE_DIR + "/backups" else [])
+            question = "Back up to %s?\n\nThis can take a while on a slow drive." % dest
+            under = lambda: self.screen.blit(self.bg, (0, 0))
+        if question and not self.confirm(under, title, question, default_yes=key not in NO_CONFIRM_DEFAULT):
+            return None
+        proc = step_start(argv, title)
+        rc = self.watch(title, proc.poll)
+        step_finish(rc)
+        if key == "update-now" and rc == 0 and self.confirm(lambda: self.screen.blit(self.bg, (0, 0)),
+                                                             "Reboot now?", "The x86-64-v3 image is installed. "
+                                                             "Reboot now to start it?"):
+            if not TEST_MODE():
+                subprocess.run(["sync"])
+                subprocess.run(["reboot"])
+            return "exit"
+        return None
+
+
+def cmd_gui(args):
+    os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
+    if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+        say("Full-screen menu unavailable (no display); use: menu")
+        return GUI_UNAVAILABLE
+    try:
+        import pygame
+        pygame.display.init()
+        pygame.font.init()
+        driver = pygame.display.get_driver()
+        if driver in ("offscreen", "dummy", "evdev"):
+            pygame.quit()
+            raise RuntimeError("no usable display (SDL driver %s)" % driver)
+    except Exception as e:  # no pygame or no display: the launcher falls back to the terminal menu
+        say("Full-screen menu unavailable (%s); use: menu" % e)
+        return GUI_UNAVAILABLE
+    try:
+        shots = getattr(args, "shots", None)
+        if shots:
+            os.makedirs(shots, exist_ok=True)
+        script = [t for t in (getattr(args, "script", None) or "").split(",") if t]
+        return MigrateGui(pygame, windowed=getattr(args, "windowed", False), script=script, shots=shots).run()
+    finally:
+        pygame.quit()
 
 
 def main(argv=None):
@@ -3554,7 +4108,11 @@ def main(argv=None):
     sub.add_parser("status")
     la = sub.add_parser("launcher", help="add/remove 'V3 Migration' in ES's Ports list (controller menu)")
     la.add_argument("action", nargs="?", choices=["install", "remove", "status"], default="status")
-    sub.add_parser("menu", help="the interactive menu the Ports launcher opens")
+    sub.add_parser("menu", help="the terminal menu (the launcher's fallback when the full-screen menu can't start)")
+    gu = sub.add_parser("gui", help="the full-screen menu the Ports launcher opens")
+    gu.add_argument("--windowed", action="store_true", help="1280x720 window instead of full screen")
+    gu.add_argument("--script", help=argparse.SUPPRESS)   # tests: comma-separated keys to press
+    gu.add_argument("--shots", help=argparse.SUPPRESS)    # tests: save screenshots here
     pl = sub.add_parser("init-plugin", help="create an integration template")
     pl.add_argument("name")
     pl.add_argument("--force", action="store_true")
@@ -3575,7 +4133,7 @@ def main(argv=None):
             "audit": cmd_audit, "verify-backup": cmd_verify_backup,
             "migrate": cmd_migrate, "check": cmd_integrate, "rollback": cmd_rollback,
             "status": cmd_status, "fix": cmd_fix, "prepare": cmd_prepare, "unprepare": cmd_unprepare, "init-plugin": cmd_init_plugin,
-            "launcher": cmd_launcher, "menu": cmd_menu}[args.cmd](args)
+            "launcher": cmd_launcher, "menu": cmd_menu, "gui": cmd_gui}[args.cmd](args)
 
 
 if __name__ == "__main__":
